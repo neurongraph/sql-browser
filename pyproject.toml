@@ -1,0 +1,26 @@
+[project]
+name = "sql-browser"
+version = "0.1.0"
+description = "A natural language SQLite database explorer using local LLM"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ollama>=0.3.0",
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+    "loguru>=0.7.0",
+    "json-repair>=0.30.0",
+]
+
+[project.scripts]
+sql-browser = "sql_browser.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+]
