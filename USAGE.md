@@ -6,7 +6,7 @@
    ```bash
    # Visit https://ollama.ai/ and follow installation instructions
    # Then pull a model:
-   ollama pull llama3.2
+   ollama pull gemma4:31b
    ```
 
 2. **Install dependencies**:
