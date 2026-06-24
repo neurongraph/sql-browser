@@ -1,6 +1,7 @@
 """LLM integration for natural language to SQL translation."""
 
 import json
+import time
 from typing import Dict, Optional
 
 import ollama
@@ -68,16 +69,22 @@ class LLMQueryTranslator:
         
         try:
             # Log the request
-            logger.debug(f"Sending request to Ollama model: {self.model}")
+            prompt_chars = sum(len(m["content"]) for m in messages)
+            logger.info(
+                f"Sending request to Ollama model: {self.model} "
+                f"(prompt ~{prompt_chars} chars, ~{prompt_chars // 4} tokens)"
+            )
             logger.debug(f"Natural query: {natural_query}")
             logger.debug(f"Messages: {json.dumps(messages, indent=2)}")
-            
+
+            start = time.monotonic()
             response = ollama.chat(
                 model=self.model,
                 messages=messages,
                 format="json"
             )
-            
+            logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
+
             # Log the raw response (convert to dict first)
             try:
                 response_dict = dict(response) if hasattr(response, '__dict__') else response
@@ -257,15 +264,21 @@ Respond in JSON format with a "suggestions" array containing 5 strings.
 Example: {{"suggestions": ["Show me all users", "What is the total revenue?", ...]}}"""
 
         try:
+            logger.info(
+                f"Sending suggestions request to Ollama model: {self.model} "
+                f"(prompt ~{len(prompt)} chars, ~{len(prompt) // 4} tokens)"
+            )
+            start = time.monotonic()
             response = ollama.chat(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 format="json"
             )
-            
+            logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
+
             result = json.loads(response['message']['content'])
             return result.get('suggestions', [])
-            
+
         except Exception:
             # Return generic suggestions if LLM fails
             return [

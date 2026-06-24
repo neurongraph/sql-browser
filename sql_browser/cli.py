@@ -69,8 +69,10 @@ class SQLBrowserSession:
             schema_info = self.db_inspector.get_schema_description()
 
             # Show suggestions
-            self.executor.display_info("Waiting for LLM to generate suggestions...")
-            suggestions = self.llm.get_query_suggestions(schema_info)
+            with self.executor.console.status(
+                "[cyan]Waiting for LLM to generate suggestions...[/cyan]", spinner="dots"
+            ):
+                suggestions = self.llm.get_query_suggestions(schema_info)
             self.executor.display_suggestions(suggestions)
             
             # Main interaction loop
@@ -135,15 +137,17 @@ class SQLBrowserSession:
                     continue
                 
                 # Translate natural language to SQL
-                self.executor.display_info("Thinking...")
                 logger.debug("Translating natural language to SQL...")
-                
+
                 try:
-                    result = self.llm.translate_to_sql(
-                        user_input,
-                        schema_info,
-                        self.conversation_history
-                    )
+                    with self.executor.console.status(
+                        "[cyan]Thinking... (waiting for LLM)[/cyan]", spinner="dots"
+                    ):
+                        result = self.llm.translate_to_sql(
+                            user_input,
+                            schema_info,
+                            self.conversation_history
+                        )
                     
                     sql = result['sql']
                     explanation = result['explanation']
