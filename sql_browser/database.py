@@ -20,6 +20,7 @@ class DatabaseInspector:
         
         self.connection: Optional[sqlite3.Connection] = None
         self._schema_cache: Optional[Dict[str, Any]] = None
+        self.profile: Dict[str, Dict[str, Any]] = {}
 
     def connect(self) -> None:
         """Establish connection to the database."""
@@ -52,8 +53,8 @@ class DatabaseInspector:
         
         cursor = self.connection.cursor()
         cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != '_sql_browser_profile'
             ORDER BY name
         """)
         return [row[0] for row in cursor.fetchall()]
@@ -144,6 +145,26 @@ class DatabaseInspector:
         cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
         return cursor.fetchone()[0]
 
+    def get_distinct_values(self, table_name: str, column_name: str, limit: int = 50) -> List[Any]:
+        """Get the distinct values present in a column.
+
+        Args:
+            table_name: Name of the table
+            column_name: Name of the column
+            limit: Maximum number of distinct values to return
+
+        Returns:
+            List of distinct values found in the column
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = self.connection.cursor()
+        cursor.execute(
+            f'SELECT DISTINCT "{column_name}" FROM "{table_name}" LIMIT ?', (limit,)
+        )
+        return [row[0] for row in cursor.fetchall()]
+
     def execute_query(self, query: str) -> Tuple[List[str], List[Tuple]]:
         """Execute a SQL query and return results.
         
@@ -181,11 +202,37 @@ class DatabaseInspector:
             lines.append(f"\nTable: {table_name} ({table_info['row_count']} rows)")
             lines.append("Columns:")
             
+            column_profiles = self.profile.get(table_name, {})
             for col in table_info['columns']:
                 pk_marker = " [PRIMARY KEY]" if col['pk'] else ""
                 null_marker = " NOT NULL" if col['notnull'] else ""
-                lines.append(f"  - {col['name']}: {col['type']}{pk_marker}{null_marker}")
-        
+                hint = self._format_profile_hint(column_profiles.get(col['name']))
+                lines.append(f"  - {col['name']}: {col['type']}{pk_marker}{null_marker}{hint}")
+
         return "\n".join(lines)
+
+    # Cap how many enum values are inlined into the LLM-facing schema text so a
+    # database with many categorical columns doesn't blow up the prompt size
+    # (the full list is still cached in `self.profile` for query correction).
+    MAX_ENUM_VALUES_IN_SCHEMA = 8
+
+    @staticmethod
+    def _format_profile_hint(column_profile: Optional[Dict[str, Any]]) -> str:
+        """Format a profiled column's known values/range as a schema hint."""
+        if not column_profile:
+            return ""
+
+        if column_profile["type"] == "enum":
+            values = column_profile["values"]
+            shown = values[:DatabaseInspector.MAX_ENUM_VALUES_IN_SCHEMA]
+            formatted = ", ".join(repr(v) for v in shown)
+            if len(values) > len(shown):
+                formatted += f", ... ({len(values) - len(shown)} more)"
+            return f" (values: {formatted})"
+
+        if column_profile["type"] == "range":
+            return f" (range: {column_profile['min']} to {column_profile['max']})"
+
+        return ""
 
 # Made with Bob

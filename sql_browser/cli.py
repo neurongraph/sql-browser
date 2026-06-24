@@ -8,7 +8,10 @@ import typer
 from rich.prompt import Prompt
 
 from .database import DatabaseInspector
+from .excel_loader import EXCEL_EXTENSIONS, ExcelLoadError, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator
+from .profiler import profile_database
+from .query_corrector import resolve_value_mismatches
 from .query_executor import QueryExecutor
 from .logger import get_logger, LOGS_DIR
 
@@ -18,18 +21,31 @@ logger = get_logger(__name__)
 class SQLBrowserSession:
     """Manages an interactive SQL Browser session."""
 
-    def __init__(self, db_path: str, model: str = "llama3.2"):
+    def __init__(self, db_path: str, model: str = "llama3.2", profile: bool = True):
         """Initialize the session.
-        
+
         Args:
-            db_path: Path to the SQLite database
+            db_path: Path to the SQLite database, or an Excel workbook
+                (each sheet becomes a table in a temporary SQLite database)
             model: Ollama model to use
+            profile: Whether to profile the database (column value/range
+                hints) at startup to improve text-to-SQL accuracy
         """
-        self.db_path = db_path
-        self.db_inspector = DatabaseInspector(db_path)
+        self.source_path = Path(db_path)
+        self._temp_db_path: Optional[Path] = None
+
+        if self.source_path.suffix.lower() in EXCEL_EXTENSIONS:
+            logger.info(f"Converting Excel workbook to temporary SQLite database: {self.source_path}")
+            self._temp_db_path = convert_xlsx_to_sqlite(self.source_path)
+            self.db_path = str(self._temp_db_path)
+        else:
+            self.db_path = str(self.source_path)
+
+        self.db_inspector = DatabaseInspector(self.db_path)
         self.llm = LLMQueryTranslator(model=model)
         self.executor: Optional[QueryExecutor] = None
         self.conversation_history = []
+        self.profile_enabled = profile
 
     def start(self) -> None:
         """Start the interactive session."""
@@ -44,12 +60,16 @@ class SQLBrowserSession:
             logger.debug("Database connected successfully")
             
             # Display welcome message
-            self.executor.display_welcome(self.db_path)
-            
+            self.executor.display_welcome(str(self.source_path))
+
+            if self.profile_enabled:
+                self._run_profiling()
+
             # Get schema for LLM context
             schema_info = self.db_inspector.get_schema_description()
-            
+
             # Show suggestions
+            self.executor.display_info("Waiting for LLM to generate suggestions...")
             suggestions = self.llm.get_query_suggestions(schema_info)
             self.executor.display_suggestions(suggestions)
             
@@ -71,6 +91,28 @@ class SQLBrowserSession:
             if self.db_inspector:
                 logger.debug("Disconnecting from database")
                 self.db_inspector.disconnect()
+            if self._temp_db_path:
+                logger.debug(f"Removing temporary database: {self._temp_db_path}")
+                self._temp_db_path.unlink(missing_ok=True)
+
+    def _run_profiling(self, force: bool = False) -> None:
+        """Profile the database and report a short summary."""
+        logger.debug("Profiling database...")
+        self.executor.display_info("Profiling database...")
+        self.db_inspector.profile = profile_database(self.db_inspector, force=force)
+
+        enum_cols = sum(
+            1 for cols in self.db_inspector.profile.values()
+            for info in cols.values() if info["type"] == "enum"
+        )
+        range_cols = sum(
+            1 for cols in self.db_inspector.profile.values()
+            for info in cols.values() if info["type"] == "range"
+        )
+        logger.info(f"Profiling complete: {enum_cols} enum column(s), {range_cols} range column(s)")
+        self.executor.display_info(
+            f"Profiling complete: {enum_cols} categorical column(s), {range_cols} numeric range column(s)"
+        )
 
     def _interaction_loop(self, schema_info: str) -> None:
         """Main interaction loop.
@@ -120,7 +162,12 @@ class SQLBrowserSession:
                         self.executor.display_warning(
                             "Low confidence in this query. Please verify the results."
                         )
-                    
+
+                    # Check for guessed literal values that don't exist in the data
+                    sql = resolve_value_mismatches(
+                        sql, self.db_inspector, self._ask_value_choice
+                    )
+
                     # Execute and display
                     logger.debug(f"Executing SQL: {sql}")
                     success = self.executor.execute_and_display(
@@ -163,6 +210,38 @@ class SQLBrowserSession:
                 logger.exception("Unexpected error in interaction loop")
                 self.executor.display_warning(f"Unexpected error: {e}")
 
+    def _ask_value_choice(
+        self, column: str, attempted_value: str, candidates: list
+    ) -> Optional[str]:
+        """Ask the user to pick a real column value when the LLM guessed wrong.
+
+        Args:
+            column: Name of the column being filtered
+            attempted_value: The literal value the LLM guessed
+            candidates: Actual distinct values present in the column
+
+        Returns:
+            The value the user picked, or None to run the query unchanged
+        """
+        self.executor.display_warning(
+            f"'{attempted_value}' was not found in column '{column}'."
+        )
+        self.executor.console.print(f"[cyan]Actual values for {column}:[/cyan]")
+        for i, candidate in enumerate(candidates, 1):
+            self.executor.console.print(f"  {i}. {candidate}")
+
+        choice = Prompt.ask(
+            "Pick a number to use instead, or press Enter to run the query as-is",
+            default=""
+        ).strip()
+
+        if choice.isdigit():
+            index = int(choice) - 1
+            if 0 <= index < len(candidates):
+                return candidates[index]
+
+        return None
+
     def _handle_special_command(self, command: str) -> bool:
         """Handle special commands.
         
@@ -203,8 +282,37 @@ class SQLBrowserSession:
             logger.info("Showing logs directory")
             self.executor.display_info(f"Logs are stored in: {LOGS_DIR}")
             return True
-        
+
+        elif command == 'profile':
+            if not self.db_inspector.profile:
+                logger.info("Profiling database on demand")
+                self._run_profiling()
+            else:
+                logger.info("Re-profiling database")
+                self._run_profiling(force=True)
+            self._show_profile()
+            return True
+
         return False
+
+    def _show_profile(self) -> None:
+        """Display the cached column profile (values/ranges)."""
+        if not any(self.db_inspector.profile.values()):
+            self.executor.display_info("No columns were profiled (no low-cardinality or numeric columns found).")
+            return
+
+        for table, columns in self.db_inspector.profile.items():
+            if not columns:
+                continue
+            self.executor.console.print(f"\n[bold cyan]{table}[/bold cyan]")
+            for column, info in columns.items():
+                if info["type"] == "enum":
+                    values = ", ".join(str(v) for v in info["values"])
+                    self.executor.console.print(f"  [yellow]{column}[/yellow]: {values}")
+                elif info["type"] == "range":
+                    self.executor.console.print(
+                        f"  [yellow]{column}[/yellow]: {info['min']} to {info['max']}"
+                    )
 
     def _show_help(self) -> None:
         """Display help information."""
@@ -222,6 +330,7 @@ class SQLBrowserSession:
 [yellow]Special Commands:[/yellow]
   • schema  - Display the complete database schema
   • tables  - List all tables in the database
+  • profile - Show (or refresh) profiled column values/ranges
   • clear   - Clear conversation history
   • logs    - Show logs directory location
   • help    - Show this help message
@@ -255,7 +364,8 @@ def version_callback(value: bool):
 def cli(
     database: Path = typer.Argument(
         ...,
-        help="Path to the SQLite database file",
+        help="Path to a SQLite database file, or an Excel workbook (.xlsx/.xlsm) "
+        "whose sheets will be loaded as tables",
         exists=True,
         file_okay=True,
         dir_okay=False,
@@ -267,6 +377,11 @@ def cli(
         "-m",
         help="Ollama model to use",
     ),
+    no_profile: bool = typer.Option(
+        False,
+        "--no-profile",
+        help="Skip profiling the database (column values/ranges) for text-to-SQL hints",
+    ),
     version: Optional[bool] = typer.Option(
         None,
         "--version",
@@ -277,17 +392,28 @@ def cli(
     ),
 ) -> None:
     """SQL Browser - Natural language SQLite database explorer.
-    
+
     Ask questions about your SQLite database in plain English and get SQL results.
-    
+    Excel workbooks (.xlsx/.xlsm) are also supported: each sheet is loaded as a
+    table in a temporary SQLite database for the duration of the session.
+
     Examples:
-    
+
       \b
       sql-browser mydata.db
+      sql-browser mydata.xlsx
       sql-browser --model llama3.1 mydata.db
+      sql-browser --no-profile mydata.db
     """
     # Start session
-    session = SQLBrowserSession(str(database), model=model)
+    try:
+        session = SQLBrowserSession(str(database), model=model, profile=not no_profile)
+    except ExcelLoadError as e:
+        logger.error(f"Failed to load Excel workbook: {e}")
+        typer.echo(f"Error: could not load '{database.name}':", err=True)
+        for issue in e.issues:
+            typer.echo(f"  - {issue}", err=True)
+        raise typer.Exit(1)
     session.start()
 
 
