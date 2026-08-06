@@ -128,7 +128,7 @@ While in the interactive terminal session:
 - `schema` - Display the complete database schema
 - `tables` - List all tables in the database
 - `profile` - Show (or refresh) profiled column values/ranges
-- `metadata` - Show the curated metadata layer and any warnings
+- `metadata` - Reload the metadata file from disk and show it, with any warnings
 - `clear` - Clear conversation history
 - `logs` - Show logs directory location
 - `help` - Show help message
@@ -248,7 +248,8 @@ temporary database it's converted into.
 
 Metadata is additive only — it can never override the real schema, and anything
 naming a table, column or value that doesn't exist is dropped with a warning.
-Run `metadata` in the REPL to see what was loaded and what was ignored.
+Run `metadata` in the REPL to see what was loaded and what was ignored; it also
+re-reads the file, so you can refine it without restarting the session.
 
 ### Programmatic Usage
 

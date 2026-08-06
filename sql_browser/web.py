@@ -582,7 +582,13 @@ def create_app(
             "database": session.source_path.name,
             "tables": tables,
             "relationships": [
-                {"from": r.from_, "to": r.to, "declared": r.declared}
+                {
+                    "from": r.from_,
+                    "to": r.to,
+                    "label": r.describe(),
+                    "composite": r.is_composite,
+                    "declared": r.declared,
+                }
                 for r in (metadata.relationships if metadata else [])
             ],
             "metadata_warnings": metadata_warnings,

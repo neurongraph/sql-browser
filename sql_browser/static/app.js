@@ -252,7 +252,13 @@ function renderSchema(tables, relationships, metadataWarnings) {
  */
 function renderSchemaExtras(relationships, metadataWarnings) {
   const sections = [
-    { title: "Relationships", className: "schema-rels", items: relationships.map((r) => `${r.from} → ${r.to}`) },
+    {
+      title: "Relationships",
+      className: "schema-rels",
+      items: relationships.map(
+        (r) => (r.label || `${r.from} → ${r.to}`) + (r.composite ? "  (composite key)" : ""),
+      ),
+    },
     { title: "Metadata warnings", className: "schema-warnings", items: metadataWarnings },
   ];
 

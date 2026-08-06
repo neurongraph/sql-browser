@@ -280,6 +280,87 @@ def test_use_file_false_skips_the_sidecar_but_keeps_foreign_keys(inspector, db_p
 
 
 # --------------------------------------------------------------------------- #
+# Composite foreign keys
+# --------------------------------------------------------------------------- #
+
+def test_composite_foreign_key_is_one_constraint(composite_inspector):
+    """Both columns of the key must stay on a single edge, in declaration order."""
+    keys = composite_inspector.get_foreign_keys("offices")
+
+    assert keys == [
+        {"table": "regions", "columns": [("country", "country"), ("region_code", "code")]}
+    ]
+
+
+def test_composite_key_resolves_an_implicit_parent_key(composite_inspector):
+    """`REFERENCES regions` pairs each column with the parent PK at that position."""
+    keys = composite_inspector.get_foreign_keys("depots")
+
+    assert keys == [
+        {"table": "regions", "columns": [("c", "country"), ("rc", "code")]}
+    ]
+
+
+def test_single_column_implicit_reference(composite_inspector):
+    assert composite_inspector.get_foreign_keys("staff") == [
+        {"table": "offices", "columns": [("office_id", "id")]}
+    ]
+
+
+def test_reference_to_a_parent_without_a_primary_key_is_dropped(composite_inspector):
+    """Better no edge than half of one - a guessed join is worse than none."""
+    assert composite_inspector.get_foreign_keys("orphans") == []
+
+
+def test_composite_edge_renders_as_a_single_join(composite_inspector):
+    reconciled, warnings = md.reconcile(md.Metadata(), composite_inspector)
+
+    composite = [r for r in reconciled.relationships if r.is_composite]
+    assert len(composite) == 2  # offices and depots
+    described = {r.describe() for r in composite}
+    assert "offices.(country, region_code) -> regions.(country, code)" in described
+    assert warnings == []
+
+
+def test_authored_composite_relationship_accepts_a_list(composite_inspector):
+    """`from: [a, b]` is as valid as `from: "a, b"` - both are natural in YAML."""
+    metadata = md.Metadata.model_validate(
+        {
+            "relationships": [
+                {
+                    "from": ["offices.country", "offices.region_code"],
+                    "to": ["regions.country", "regions.code"],
+                }
+            ]
+        }
+    )
+
+    reconciled, warnings = md.reconcile(metadata, composite_inspector)
+
+    authored = [r for r in reconciled.relationships if not r.declared]
+    assert len(authored) == 1
+    assert authored[0].is_composite
+    assert authored[0].from_refs == ["offices.country", "offices.region_code"]
+    assert warnings == []
+
+
+def test_mismatched_composite_column_counts_are_rejected(composite_inspector):
+    """Two columns on one side and one on the other describes no usable join."""
+    metadata = md.Metadata.model_validate(
+        {
+            "relationships": [
+                {"from": "offices.country, offices.region_code", "to": "regions.code"}
+            ]
+        }
+    )
+
+    reconciled, warnings = md.reconcile(metadata, composite_inspector)
+
+    assert all(r.declared for r in reconciled.relationships)
+    assert any("column(s) on the left" in w for w in warnings)
+
+
+# --------------------------------------------------------------------------- #
 # resolve_label and the value corrector
 # --------------------------------------------------------------------------- #
 
@@ -366,6 +447,100 @@ def test_corrector_still_asks_when_no_label_matches(labelled_inspector):
 
     assert len(mismatches) == 1
     assert mismatches[0]["attempted_value"] == "quantum"
+
+
+def test_ambiguous_synonym_is_reported_and_not_resolved(inspector):
+    """Two codes claiming one phrase can't be resolved, so it must not be guessed.
+
+    Silently picking one would rewrite the query to a value that is *valid* -
+    so nothing downstream flags it - but quite possibly not what was meant.
+    """
+    metadata = md.Metadata.model_validate(
+        {
+            "tables": {
+                "orders": {
+                    "columns": {
+                        "status": {
+                            "values": {
+                                "P": {"label": "Pending", "synonyms": ["done"]},
+                                "S": {"label": "Shipped", "synonyms": ["done"]},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    reconciled, warnings = md.reconcile(metadata, inspector)
+
+    assert any("'done' is claimed by" in w for w in warnings)
+    assert md.resolve_label(reconciled, "orders", "status", "done") is None
+    # The unambiguous labels still work.
+    assert md.resolve_label(reconciled, "orders", "status", "Shipped") == "S"
+
+
+def test_ambiguous_value_falls_through_to_the_picker(inspector):
+    metadata = md.Metadata.model_validate(
+        {
+            "tables": {
+                "orders": {
+                    "columns": {
+                        "status": {
+                            "values": {
+                                "P": {"label": "Pending", "synonyms": ["done"]},
+                                "S": {"label": "Shipped", "synonyms": ["done"]},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    )
+    inspector.metadata, inspector.metadata_warnings = md.reconcile(metadata, inspector)
+
+    sql, mismatches = find_value_mismatches(
+        "SELECT * FROM orders WHERE status = 'done'", inspector
+    )
+
+    assert "'done'" in sql  # left alone, not silently rewritten
+    assert len(mismatches) == 1
+
+
+def test_label_colliding_with_another_code_is_reported(inspector):
+    """`'P'` labelled "S" while `'S'` exists is confusing enough to flag."""
+    metadata = md.Metadata.model_validate(
+        {
+            "tables": {
+                "orders": {
+                    "columns": {
+                        "status": {
+                            "values": {"P": {"label": "S"}, "S": {"label": "Shipped"}}
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    _, warnings = md.reconcile(metadata, inspector)
+
+    assert any("is also the code" in w for w in warnings)
+
+
+def test_a_single_value_needs_no_ambiguity_check(inspector):
+    """One documented code can't collide with anything - no spurious warnings."""
+    metadata = md.Metadata.model_validate(
+        {
+            "tables": {
+                "orders": {"columns": {"status": {"values": {"S": {"label": "S"}}}}}
+            }
+        }
+    )
+
+    _, warnings = md.reconcile(metadata, inspector)
+
+    assert warnings == []
 
 
 def test_corrector_without_metadata_behaves_as_before(inspector):

@@ -144,7 +144,7 @@ While in the interactive terminal session:
 - `schema` - Display the complete database schema
 - `tables` - List all tables in the database
 - `profile` - Show (or refresh) profiled column values/ranges
-- `metadata` - Show the curated metadata layer and any warnings
+- `metadata` - Reload the metadata file from disk and show it, with any warnings
 - `clear` - Clear conversation history
 - `logs` - Show logs directory location
 - `help` - Show help message
@@ -168,8 +168,11 @@ uv run sql-browser --init-metadata mydata.db
 That writes `mydata.meta.yaml` pre-filled with every table, every column, and
 the real categorical values found in each — you supply the meanings. Add
 `--llm-draft` to have the model take a first pass at the descriptions for you to
-correct. The file is discovered automatically from then on; run the `metadata`
-command in the REPL to see what was loaded.
+correct. The file is discovered automatically from then on.
+
+The `metadata` command in the REPL shows what was loaded and **reloads the file
+from disk**, so you can edit it in another window and have the next question use
+the change — no restart per edit.
 
 `examples/sample.meta.yaml` is a complete worked example:
 
@@ -203,7 +206,16 @@ relationships:                             # declared foreign keys are automatic
   - from: order_items.order_id
     to: orders.id
     cardinality: many_to_one
+
+  - from: [offices.country, offices.region_code]   # composite key: list both
+    to:   [regions.country, regions.code]          # sides, in matching order
 ```
+
+Composite keys must be written as one relationship with both columns on each
+side, never as two separate entries — a composite key joined on only one of its
+columns fans out and silently returns wrong rows, so the model is told to use all
+of them together. Declared composite foreign keys are grouped this way
+automatically.
 
 What each part buys you:
 

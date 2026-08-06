@@ -175,7 +175,7 @@ class QueryExecutor:
         welcome_text.append(" - Show/refresh profiled column values\n", style="white")
         welcome_text.append("  • ", style="dim")
         welcome_text.append("'metadata'", style="yellow")
-        welcome_text.append(" - Show the curated metadata layer\n", style="white")
+        welcome_text.append(" - Reload/show the curated metadata\n", style="white")
         welcome_text.append("  • ", style="dim")
         welcome_text.append("'help'", style="yellow")
         welcome_text.append(" - Show help message\n", style="white")

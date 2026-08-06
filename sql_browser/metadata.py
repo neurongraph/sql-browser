@@ -157,7 +157,14 @@ class TableMeta(_LenientModel):
 
 
 class Relationship(_LenientModel):
-    """A join edge between two columns, in `table.column` form."""
+    """A join edge between two tables, written as `table.column` on each side.
+
+    A composite key is expressed by giving both sides a comma-separated column
+    list - `from: offices.country, offices.region_code`. Keeping the columns of
+    one constraint together matters: joining a composite key on only one of its
+    columns fans out and returns wrong rows, so presenting them as separate
+    edges would be presenting an invalid join path as valid.
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -169,18 +176,49 @@ class Relationship(_LenientModel):
     #: True when this edge came from PRAGMA foreign_key_list rather than the file.
     declared: bool = False
 
-    @property
-    def from_parts(self) -> Tuple[str, str]:
-        return _split_ref(self.from_)
+    @field_validator("from_", "to", mode="before")
+    @classmethod
+    def _normalize_refs(cls, value: Any) -> Any:
+        """Accept a YAML list of columns as well as a comma-separated string."""
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(item) for item in value)
+        return value
 
     @property
-    def to_parts(self) -> Tuple[str, str]:
-        return _split_ref(self.to)
+    def from_refs(self) -> List[str]:
+        """The `table.column` references on the child side, in key order."""
+        return _split_refs(self.from_)
+
+    @property
+    def to_refs(self) -> List[str]:
+        """The `table.column` references on the parent side, in key order."""
+        return _split_refs(self.to)
+
+    @property
+    def from_table(self) -> str:
+        return _split_ref(self.from_refs[0])[0] if self.from_refs else ""
+
+    @property
+    def to_table(self) -> str:
+        return _split_ref(self.to_refs[0])[0] if self.to_refs else ""
+
+    @property
+    def is_composite(self) -> bool:
+        return len(self.from_refs) > 1
 
     @property
     def key(self) -> Tuple[str, str]:
         """Identity for de-duplicating file-declared against PRAGMA-derived edges."""
         return (self.from_, self.to)
+
+    def describe(self) -> str:
+        """Render the edge for a prompt or a UI.
+
+        A composite key is grouped so it reads as one join on several columns
+        rather than as several separate joins:
+        ``offices.(country, region_code) -> regions.(country, code)``
+        """
+        return f"{_group_refs(self.from_refs)} -> {_group_refs(self.to_refs)}"
 
 
 class GlossaryTerm(_LenientModel):
@@ -241,6 +279,32 @@ def _split_ref(ref: str) -> Tuple[str, str]:
     if not column:
         return "", ref
     return table, column
+
+
+def _split_refs(refs: str) -> List[str]:
+    """Split one side of a relationship into its `table.column` references."""
+    return [part.strip() for part in refs.split(",") if part.strip()]
+
+
+def _group_refs(refs: List[str]) -> str:
+    """Render one side of an edge, collapsing a composite key onto its table.
+
+    ``["offices.country", "offices.region_code"]`` becomes
+    ``offices.(country, region_code)`` so the columns read as one key. Falls
+    back to a plain join when the references don't share a table, which only
+    happens in a malformed file.
+    """
+    if not refs:
+        return ""
+    if len(refs) == 1:
+        return refs[0]
+
+    tables = {_split_ref(ref)[0] for ref in refs}
+    if len(tables) != 1:
+        return ", ".join(refs)
+    table = next(iter(tables))
+    columns = ", ".join(_split_ref(ref)[1] for ref in refs)
+    return f"{table}.({columns})"
 
 
 # --------------------------------------------------------------------------- #
@@ -310,14 +374,22 @@ def load(path: Path) -> Metadata:
 # --------------------------------------------------------------------------- #
 
 def _foreign_key_relationships(db_inspector: DatabaseInspector) -> List[Relationship]:
-    """Build relationships from the database's own declared foreign keys."""
+    """Build relationships from the database's own declared foreign keys.
+
+    One relationship per constraint, so the columns of a composite key stay
+    together as a single join path.
+    """
     relationships = []
     for table in db_inspector.get_tables():
         for fk in db_inspector.get_foreign_keys(table):
+            child_refs = [f"{table}.{child}" for child, _ in fk["columns"]]
+            parent_refs = [f"{fk['table']}.{parent}" for _, parent in fk["columns"]]
+            if not child_refs:
+                continue
             relationships.append(
                 Relationship(
-                    from_=f"{table}.{fk['from']}",
-                    to=f"{fk['table']}.{fk['to']}",
+                    from_=", ".join(child_refs),
+                    to=", ".join(parent_refs),
                     cardinality="many_to_one",
                     declared=True,
                 )
@@ -384,9 +456,54 @@ def _reconcile_columns(
                         }
                     )
 
+        _warn_on_ambiguous_labels(table, column, column_meta, warnings)
         kept[column] = column_meta
 
     return kept
+
+
+def _warn_on_ambiguous_labels(
+    table: str, column: str, column_meta: ColumnMeta, warnings: List[str]
+) -> None:
+    """Report labels or synonyms that don't identify a single code.
+
+    Worth surfacing rather than logging quietly: the whole point of a value
+    dictionary is that a phrase maps to one code, so a collision means the
+    dictionary can't do its job for that phrase - and resolve_label will decline
+    to rewrite it rather than guess.
+    """
+    values = column_meta.values
+    if len(values) < 2:
+        return
+
+    claims: Dict[str, List[str]] = {}
+    for code, meaning in values.items():
+        for phrase in [meaning.label, *meaning.synonyms]:
+            normalized = phrase.strip().lower()
+            if normalized:
+                claims.setdefault(normalized, []).append(code)
+
+    for phrase, codes in claims.items():
+        if len(codes) > 1:
+            warnings.append(
+                f"{table}.{column}: {phrase!r} is claimed by "
+                f"{', '.join(repr(c) for c in codes)} - too ambiguous to resolve, "
+                f"so it won't be corrected automatically"
+            )
+
+    # A label that is also a different code is confusing for the same reason,
+    # though harmless in practice: a literal matching a real code is left alone
+    # before labels are ever consulted.
+    for code, meaning in values.items():
+        normalized = meaning.label.strip().lower()
+        collides = [
+            other for other in values if other != code and other.lower() == normalized
+        ]
+        if collides:
+            warnings.append(
+                f"{table}.{column}: label {meaning.label!r} on {code!r} is also the "
+                f"code {collides[0]!r} - the code wins"
+            )
 
 
 def _reconcile_relationships(
@@ -404,12 +521,29 @@ def _reconcile_relationships(
         return bool(table) and column in columns_by_table.get(table, set())
 
     for relationship in metadata.relationships:
-        if not endpoint_exists(relationship.from_) or not endpoint_exists(relationship.to):
+        from_refs, to_refs = relationship.from_refs, relationship.to_refs
+
+        if not from_refs or not to_refs:
             warnings.append(
-                f"relationship {relationship.from_} -> {relationship.to}: "
+                f"relationship {relationship.describe()}: "
+                f"both sides need a table.column reference - ignored"
+            )
+            continue
+        # A composite key must pair up, or the join it describes is unusable.
+        if len(from_refs) != len(to_refs):
+            warnings.append(
+                f"relationship {relationship.describe()}: "
+                f"{len(from_refs)} column(s) on the left but {len(to_refs)} on the "
+                f"right - ignored"
+            )
+            continue
+        if not all(endpoint_exists(ref) for ref in from_refs + to_refs):
+            warnings.append(
+                f"relationship {relationship.describe()}: "
                 f"unknown table or column - ignored"
             )
             continue
+
         if relationship.key in seen:
             continue
         seen.add(relationship.key)
@@ -684,6 +818,17 @@ def build_scaffold(
 # Lookup used by the query corrector
 # --------------------------------------------------------------------------- #
 
+def _codes_matching(values: Dict[str, ColumnValue], needle: str) -> List[str]:
+    """Return every code whose label or a synonym equals `needle`, lowercased."""
+    matches = []
+    for code, meaning in values.items():
+        if meaning.label.strip().lower() == needle or any(
+            synonym.strip().lower() == needle for synonym in meaning.synonyms
+        ):
+            matches.append(code)
+    return matches
+
+
 def resolve_label(
     metadata: Optional[Metadata], table: str, column: str, value: str
 ) -> Optional[str]:
@@ -694,6 +839,12 @@ def resolve_label(
     only offer the user a list of opaque codes to choose between - which needs
     the very knowledge the metadata file exists to record.
 
+    Resolves only when exactly one code matches. A label or synonym claimed by
+    two codes is genuinely ambiguous, and picking one would silently rewrite the
+    query to a value that is valid - so nothing downstream would flag it - but
+    quite possibly not what was meant. Better to leave the literal alone and let
+    the existing value-mismatch path ask.
+
     Args:
         metadata: Reconciled metadata, or None
         table: Table the column belongs to
@@ -701,7 +852,7 @@ def resolve_label(
         value: The literal the LLM guessed
 
     Returns:
-        The real code, or None if the value isn't a known label or synonym
+        The real code, or None if the value matches no label or several
     """
     if metadata is None:
         return None
@@ -710,12 +861,14 @@ def resolve_label(
     if not values:
         return None
 
-    needle = value.strip().lower()
-    for code, meaning in values.items():
-        if meaning.label.strip().lower() == needle:
-            return code
-        if any(synonym.strip().lower() == needle for synonym in meaning.synonyms):
-            return code
+    matches = _codes_matching(values, value.strip().lower())
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        logger.debug(
+            f"Not resolving {table}.{column} = {value!r}: ambiguous between "
+            f"{', '.join(repr(m) for m in matches)}"
+        )
     return None
 
 # Made with Bob

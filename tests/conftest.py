@@ -55,4 +55,67 @@ def inspector(db_path):
     yield inspector
     inspector.disconnect()
 
+
+@pytest.fixture
+def composite_db_path(tmp_path):
+    """A database exercising every shape of foreign key declaration.
+
+    Composite keys are the interesting case: `PRAGMA foreign_key_list` reports
+    one row per column, and treating those rows as independent edges would
+    present a join on a single column of the key as valid - which fans out and
+    returns wrong rows.
+    """
+    path = tmp_path / "composite.db"
+    connection = sqlite3.connect(str(path))
+    connection.executescript(
+        """
+        CREATE TABLE regions (
+            country TEXT,
+            code TEXT,
+            name TEXT,
+            PRIMARY KEY (country, code)
+        );
+        -- composite key, parent columns named explicitly
+        CREATE TABLE offices (
+            id INTEGER PRIMARY KEY,
+            country TEXT,
+            region_code TEXT,
+            FOREIGN KEY (country, region_code) REFERENCES regions(country, code)
+        );
+        -- composite key targeting the parent's primary key implicitly
+        CREATE TABLE depots (
+            id INTEGER PRIMARY KEY,
+            c TEXT,
+            rc TEXT,
+            FOREIGN KEY (c, rc) REFERENCES regions
+        );
+        -- single column, implicit parent key
+        CREATE TABLE staff (
+            id INTEGER PRIMARY KEY,
+            office_id INTEGER REFERENCES offices
+        );
+        -- parent has no primary key at all, so the reference is unresolvable
+        CREATE TABLE nokey (a TEXT, b TEXT);
+        CREATE TABLE orphans (
+            id INTEGER PRIMARY KEY,
+            a TEXT,
+            FOREIGN KEY (a) REFERENCES nokey
+        );
+        INSERT INTO regions VALUES ('US','CA','California'), ('FR','CA','Cantal');
+        INSERT INTO offices VALUES (1,'US','CA');
+        """
+    )
+    connection.commit()
+    connection.close()
+    return path
+
+
+@pytest.fixture
+def composite_inspector(composite_db_path):
+    """A connected inspector over the composite-key database."""
+    inspector = DatabaseInspector(str(composite_db_path))
+    inspector.connect()
+    yield inspector
+    inspector.disconnect()
+
 # Made with Bob

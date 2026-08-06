@@ -155,6 +155,19 @@ def test_column_annotations_render(inspector):
     assert "PII" in text
 
 
+def test_composite_key_is_rendered_as_one_join_with_a_warning(composite_inspector):
+    """The model must be told to use every column, or the join fans out."""
+    composite_inspector.metadata, _ = md.reconcile(md.Metadata(), composite_inspector)
+
+    text = render_schema_context(composite_inspector)
+
+    assert "offices.(country, region_code) -> regions.(country, code)" in text
+    assert "composite key: join on ALL of these columns together" in text
+    # The columns must never appear as two independent single-column paths.
+    assert "offices.country -> regions.country" not in text
+    assert "offices.region_code -> regions.code" not in text
+
+
 def test_unprofiled_database_renders_plain_columns(db_path):
     """No profile: the listing is types only, exactly as it always was."""
     from sql_browser.database import DatabaseInspector
