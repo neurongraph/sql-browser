@@ -428,6 +428,11 @@ Returned 3 row(s)
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+[`BACKLOG.md`](BACKLOG.md) lists planned enhancements with the reasoning behind
+each, roughly prioritised — a good place to look for something to pick up.
+[`CLAUDE.md`](CLAUDE.md) documents the conventions and design principles the
+codebase follows.
+
 ## License
 
 MIT License
