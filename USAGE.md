@@ -128,6 +128,7 @@ While in the interactive terminal session:
 - `schema` - Display the complete database schema
 - `tables` - List all tables in the database
 - `profile` - Show (or refresh) profiled column values/ranges
+- `metadata` - Show the curated metadata layer and any warnings
 - `clear` - Clear conversation history
 - `logs` - Show logs directory location
 - `help` - Show help message
@@ -199,6 +200,10 @@ The default can be changed for good with `SQL_BROWSER_DEFAULT_MODEL` in `.env`.
 ### Low Quality Results
 - Try being more specific in your questions
 - Use the `schema` command to understand the database structure
+- **Write a metadata file** - if the model keeps mistaking what a column means,
+  which tables join, or how you define a term, tell it once:
+  `uv run sql-browser --init-metadata mydata.db`. See "Describing your data"
+  below and the Metadata section of the README.
 - Try a different model with `--model` option
 - Clear conversation history with `clear` command
 
@@ -215,6 +220,35 @@ uv run sql-browser /path/to/your/database.db
 uv run sql-browser /path/to/your/workbook.xlsx      # sheets -> tables
 uv run sql-browser --web /path/to/your/database.db  # browser UI
 ```
+
+### Describing your data
+
+Profiling tells the LLM what values a column holds; it can't say what they mean.
+A YAML sidecar next to your database covers the rest — value meanings, join
+paths, business definitions and standing rules:
+
+```bash
+uv run sql-browser --init-metadata mydata.db   # writes mydata.meta.yaml
+# fill in the descriptions that matter, then just open the file as usual
+uv run sql-browser mydata.db
+```
+
+Useful variants:
+
+```bash
+uv run sql-browser --init-metadata --llm-draft mydata.db  # model drafts first
+uv run sql-browser --metadata shared.meta.yaml mydata.db  # explicit file
+uv run sql-browser --no-metadata mydata.db                # ignore the sidecar
+```
+
+This matters most for Excel workbooks: a spreadsheet declares no foreign keys,
+so `relationships:` is the only way the model can learn how your sheets connect.
+Discovery uses the workbook's own name (`book.xlsx` → `book.meta.yaml`), not the
+temporary database it's converted into.
+
+Metadata is additive only — it can never override the real schema, and anything
+naming a table, column or value that doesn't exist is dropped with a warning.
+Run `metadata` in the REPL to see what was loaded and what was ignored.
 
 ### Programmatic Usage
 
@@ -236,6 +270,18 @@ llm = LLMQueryTranslator(model="gemma4:31b-cloud")
 
 with db:
     executor = QueryExecutor(db)
+
+    # Optional but recommended: attach the curated metadata layer. Reads
+    # mydata.meta.yaml if present, and always picks up declared foreign keys.
+    # Never raises - failures come back as warnings.
+    from pathlib import Path
+    from sql_browser.metadata import resolve_metadata
+
+    db.metadata, db.metadata_warnings = resolve_metadata(
+        db, source_path=Path("mydata.db")
+    )
+
+    # Composes schema + profile + foreign keys + metadata into prompt text.
     schema_info = db.get_schema_description()
 
     # 1. Translate natural language to SQL

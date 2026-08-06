@@ -11,6 +11,7 @@ from .config import DEFAULT_MODEL, settings
 from .database import DatabaseInspector
 from .excel_loader import EXCEL_EXTENSIONS, ExcelLoadError, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator
+from .metadata import build_scaffold, resolve_metadata
 from .profiler import profile_database
 from .query_corrector import resolve_value_mismatches
 from .query_executor import QueryExecutor
@@ -29,7 +30,14 @@ logger = get_logger(__name__)
 class SQLBrowserSession:
     """Manages an interactive SQL Browser session."""
 
-    def __init__(self, db_path: str, model: str = DEFAULT_MODEL, profile: bool = True):
+    def __init__(
+        self,
+        db_path: str,
+        model: str = DEFAULT_MODEL,
+        profile: bool = True,
+        metadata_path: Optional[Path] = None,
+        use_metadata: bool = True,
+    ):
         """Initialize the session.
 
         Args:
@@ -38,8 +46,12 @@ class SQLBrowserSession:
             model: Ollama model to use
             profile: Whether to profile the database (column value/range
                 hints) at startup to improve text-to-SQL accuracy
+            metadata_path: Explicit metadata file, bypassing sidecar discovery
+            use_metadata: Whether to look for a sidecar metadata file at all
         """
         self.source_path = Path(db_path)
+        self.metadata_path = metadata_path
+        self.use_metadata = use_metadata
         self._temp_db_path: Optional[Path] = None
 
         if self.source_path.suffix.lower() in EXCEL_EXTENSIONS:
@@ -72,6 +84,11 @@ class SQLBrowserSession:
 
             if self.profile_enabled:
                 self._run_profiling()
+
+            # After profiling, so a `values:` block can be checked against the
+            # values the profiler already found, and before the schema text is
+            # built, since that text is what carries metadata to the model.
+            self._load_metadata()
 
             # Get schema for LLM context
             schema_info = self.db_inspector.get_schema_description()
@@ -127,6 +144,28 @@ class SQLBrowserSession:
         self.executor.display_info(
             f"Profiling complete: {enum_cols} categorical column(s), {range_cols} numeric range column(s)"
         )
+
+    def _load_metadata(self) -> None:
+        """Load the curated metadata layer and report what came of it."""
+        self.db_inspector.metadata, self.db_inspector.metadata_warnings = resolve_metadata(
+            self.db_inspector,
+            source_path=self.source_path,
+            override=self.metadata_path,
+            use_file=self.use_metadata,
+        )
+        metadata = self.db_inspector.metadata
+        warnings = self.db_inspector.metadata_warnings
+
+        documented = sum(1 for t in metadata.tables.values() if t.description)
+        if not metadata.is_empty:
+            self.executor.display_info(
+                f"Metadata loaded: {documented} documented table(s), "
+                f"{len(metadata.relationships)} relationship(s)"
+            )
+        if warnings:
+            self.executor.display_warning(
+                f"{len(warnings)} metadata warning(s) - type 'metadata' to see them"
+            )
 
     def _interaction_loop(self, schema_info: str) -> None:
         """Main interaction loop.
@@ -357,7 +396,73 @@ class SQLBrowserSession:
             self._show_profile()
             return True
 
+        elif command == 'metadata':
+            self._show_metadata()
+            return True
+
         return False
+
+    def _show_metadata(self) -> None:
+        """Display the curated metadata layer, and anything wrong with it."""
+        metadata = self.db_inspector.metadata
+        console = self.executor.console
+
+        if metadata is None or metadata.is_empty:
+            self.executor.display_info(
+                "No metadata loaded. Create a starter file with:\n"
+                f"  sql-browser --init-metadata {self.source_path.name}"
+            )
+        else:
+            database = metadata.database
+            if database.description:
+                console.print(f"\n[bold cyan]Database[/bold cyan]\n  {database.description}")
+            if database.conventions:
+                console.print("\n[bold cyan]Conventions[/bold cyan]")
+                for key, value in database.conventions.items():
+                    console.print(f"  [yellow]{key}[/yellow]: {value}")
+            if database.rules:
+                console.print("\n[bold cyan]Rules[/bold cyan]")
+                for rule in database.rules:
+                    console.print(f"  • {rule}")
+            if database.glossary:
+                console.print("\n[bold cyan]Glossary[/bold cyan]")
+                for term in database.glossary:
+                    console.print(f"  [yellow]{term.term}[/yellow]: {term.means}")
+
+            for table, table_meta in metadata.tables.items():
+                console.print(f"\n[bold cyan]{table}[/bold cyan]")
+                if table_meta.description:
+                    console.print(f"  {table_meta.description}")
+                if table_meta.grain:
+                    console.print(f"  [dim]one row per {table_meta.grain}[/dim]")
+                for column, column_meta in table_meta.columns.items():
+                    details = []
+                    if column_meta.description:
+                        details.append(column_meta.description)
+                    if column_meta.values:
+                        details.append(
+                            ", ".join(
+                                f"{code}={meaning.label}"
+                                for code, meaning in column_meta.values.items()
+                            )
+                        )
+                    if details:
+                        console.print(f"  [yellow]{column}[/yellow]: {' | '.join(details)}")
+
+            if metadata.relationships:
+                console.print("\n[bold cyan]Relationships[/bold cyan]")
+                for rel in metadata.relationships:
+                    origin = "declared in the database" if rel.declared else "from metadata"
+                    console.print(f"  {rel.from_} → {rel.to} [dim]({origin})[/dim]")
+
+        warnings = self.db_inspector.metadata_warnings
+        if warnings:
+            console.print(
+                f"\n[bold yellow]{len(warnings)} warning(s)[/bold yellow] "
+                "[dim](these entries were ignored)[/dim]"
+            )
+            for warning in warnings:
+                console.print(f"  ⚠ {warning}")
 
     def _show_profile(self) -> None:
         """Display the cached column profile (values/ranges)."""
@@ -392,13 +497,14 @@ class SQLBrowserSession:
     • "Find customers from California"
 
 [yellow]Special Commands:[/yellow]
-  • schema  - Display the complete database schema
-  • tables  - List all tables in the database
-  • profile - Show (or refresh) profiled column values/ranges
-  • clear   - Clear conversation history
-  • logs    - Show logs directory location
-  • help    - Show this help message
-  • exit    - Exit the application (or use Ctrl+C)
+  • schema   - Display the complete database schema
+  • tables   - List all tables in the database
+  • profile  - Show (or refresh) profiled column values/ranges
+  • metadata - Show the curated metadata layer and any warnings
+  • clear    - Clear conversation history
+  • logs     - Show logs directory location
+  • help     - Show this help message
+  • exit     - Exit the application (or use Ctrl+C)
 
 [yellow]Tips:[/yellow]
   • Be specific in your questions for better results
@@ -407,6 +513,78 @@ class SQLBrowserSession:
   • Low confidence queries will show a warning
 """
         self.executor.console.print(help_text)
+
+
+def _init_metadata(source: Path, model: str, use_llm: bool) -> None:
+    """Write a starter metadata file for a database, then return.
+
+    Kept separate from SQLBrowserSession because scaffolding needs no LLM at
+    all unless --llm-draft is passed, and requiring Ollama to be running just
+    to emit a YAML skeleton would be a pointless obstacle.
+
+    Args:
+        source: The database or workbook to document
+        model: Ollama model to use for drafting
+        use_llm: Whether to have the model draft descriptions
+
+    Raises:
+        typer.Exit: The target file already exists, or the workbook is unreadable
+    """
+    destination = source.with_suffix("")
+    destination = destination.with_name(f"{destination.name}.meta.yaml")
+    if destination.exists():
+        # Never clobber documentation someone has written by hand.
+        typer.echo(
+            f"Error: {destination.name} already exists. Move or delete it first, "
+            f"or edit it directly.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    temp_db_path: Optional[Path] = None
+    if source.suffix.lower() in EXCEL_EXTENSIONS:
+        temp_db_path = convert_xlsx_to_sqlite(source)
+        db_path = temp_db_path
+    else:
+        db_path = source
+
+    inspector = DatabaseInspector(str(db_path))
+    try:
+        inspector.connect()
+
+        # Profiling is what supplies the real categorical values the scaffold
+        # pre-fills, so it's worth the wait here even though it's optional
+        # elsewhere.
+        typer.echo("Profiling database...")
+        inspector.profile = profile_database(inspector)
+
+        drafts = {}
+        if use_llm:
+            llm = LLMQueryTranslator(model=model)
+            tables = inspector.get_tables()
+            for index, table in enumerate(tables, 1):
+                typer.echo(f"Drafting documentation for '{table}' ({index}/{len(tables)})...")
+                drafts[table] = llm.draft_metadata(
+                    table,
+                    inspector.get_table_schema(table),
+                    inspector.profile.get(table, {}),
+                    inspector.get_table_sample(table, limit=3),
+                )
+
+        destination.write_text(
+            build_scaffold(inspector, source.name, drafts=drafts), encoding="utf-8"
+        )
+    finally:
+        inspector.disconnect()
+        if temp_db_path:
+            temp_db_path.unlink(missing_ok=True)
+
+    typer.echo(f"\nWrote {destination}")
+    if use_llm:
+        typer.echo("Review the drafted descriptions - the model guessed at them.")
+    else:
+        typer.echo("Fill in the descriptions that matter and delete the rest.")
+    typer.echo("It is picked up automatically next time you open this file.")
 
 
 app = typer.Typer(
@@ -446,6 +624,33 @@ def cli(
         False,
         "--no-profile",
         help="Skip profiling the database (column values/ranges) for text-to-SQL hints",
+    ),
+    metadata: Optional[Path] = typer.Option(
+        None,
+        "--metadata",
+        help="Path to a metadata file, instead of looking for one next to the database",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    no_metadata: bool = typer.Option(
+        False,
+        "--no-metadata",
+        help="Ignore any sidecar metadata file (foreign keys are still read - "
+        "those come from the database, not from metadata)",
+    ),
+    init_metadata: bool = typer.Option(
+        False,
+        "--init-metadata",
+        help="Write a starter metadata file next to the database and exit, "
+        "pre-filled with every table, column and categorical value",
+    ),
+    llm_draft: bool = typer.Option(
+        False,
+        "--llm-draft",
+        help="With --init-metadata, have the LLM draft descriptions to correct "
+        "(slower; one request per table)",
     ),
     web: bool = typer.Option(
         False,
@@ -489,9 +694,29 @@ def cli(
       sql-browser --no-profile mydata.db
       sql-browser --web mydata.db
       sql-browser --web                    # pick the file in the browser
+      sql-browser --init-metadata mydata.db    # write mydata.meta.yaml
+      sql-browser --metadata shared.meta.yaml mydata.db
     """
     if data_dir:
         settings.data_dir = data_dir
+
+    # Write a metadata skeleton and exit, rather than starting a session.
+    if init_metadata:
+        if database is None:
+            typer.echo(
+                "Error: --init-metadata needs a database or workbook to document.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        try:
+            _init_metadata(database, model or DEFAULT_MODEL, llm_draft)
+        except ExcelLoadError as e:
+            logger.error(f"Failed to load Excel workbook: {e}")
+            typer.echo(f"Error: could not load '{database.name}':", err=True)
+            for issue in e.issues:
+                typer.echo(f"  - {issue}", err=True)
+            raise typer.Exit(1)
+        return
 
     # Launch the web UI instead of the terminal REPL. The database is optional
     # here - it can be uploaded or picked from the data directory in the UI.
@@ -503,6 +728,8 @@ def cli(
             model=model,
             profile=not no_profile,
             port=port,
+            metadata_path=metadata,
+            use_metadata=not no_metadata,
         )
         return
 
@@ -517,7 +744,11 @@ def cli(
     # Start session
     try:
         session = SQLBrowserSession(
-            str(database), model=model or DEFAULT_MODEL, profile=not no_profile
+            str(database),
+            model=model or DEFAULT_MODEL,
+            profile=not no_profile,
+            metadata_path=metadata,
+            use_metadata=not no_metadata,
         )
     except ExcelLoadError as e:
         logger.error(f"Failed to load Excel workbook: {e}")

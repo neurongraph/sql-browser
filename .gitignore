@@ -53,6 +53,10 @@ Thumbs.db
 *.sqlite3
 !tests/fixtures/*.db
 
+# Metadata scaffolded next to the generated sample database. Your own
+# <database>.meta.yaml files are worth committing - only this one isn't.
+/sample.meta.yaml
+
 # Local configuration
 .env
 

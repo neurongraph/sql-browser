@@ -33,6 +33,7 @@ import sqlglot
 from sqlglot import exp
 
 from .database import DatabaseInspector
+from .metadata import resolve_label
 
 # Fallback regex for when sqlglot can't parse the query: simple column = 'value'
 _EQUALITY_PATTERN = re.compile(r"(\w+)\s*=\s*'([^']*)'")
@@ -211,7 +212,20 @@ def find_value_mismatches(
 
         value = literal.name
         candidates = _get_candidates(db_inspector, table, column, value)
-        if not candidates or value in candidates:
+        if value in candidates:
+            continue
+
+        # A curated label or synonym resolves to the stored code outright. This
+        # is checked before the candidate list is offered because the list is
+        # just opaque codes: asking the user to pick between 'P', 'S' and 'C'
+        # demands exactly the knowledge the metadata file exists to record.
+        labelled = resolve_label(db_inspector.metadata, table, column, value)
+        if labelled is not None and labelled != value:
+            literal.replace(exp.Literal.string(labelled))
+            changed = True
+            continue
+
+        if not candidates:
             continue
 
         lower_map = {c.lower(): c for c in candidates}
@@ -327,7 +341,15 @@ def _legacy_find_value_mismatches(
             continue
 
         candidates = _get_candidates(db_inspector, table, column, value)
-        if not candidates or value in candidates:
+        if value in candidates:
+            continue
+
+        labelled = resolve_label(db_inspector.metadata, table, column, value)
+        if labelled is not None and labelled != value:
+            corrected_sql = corrected_sql.replace(f"'{value}'", f"'{labelled}'")
+            continue
+
+        if not candidates:
             continue
 
         lower_map = {c.lower(): c for c in candidates}

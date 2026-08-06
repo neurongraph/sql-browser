@@ -1,0 +1,165 @@
+# Metadata for the sample database created by examples/create_sample_db.py.
+#
+# A worked example of what the metadata layer is for. Every entry here records
+# something the schema cannot express - a synonym, a trap, a business
+# definition - and none of it overrides the database: run `metadata` in the REPL
+# to see it reconciled against the real schema.
+#
+# Try it:
+#   uv run python examples/create_sample_db.py
+#   uv run sql-browser --metadata examples/sample.meta.yaml sample.db
+#
+# then ask "how much has each customer spent on delivered orders?" and compare
+# the SQL to what you get with --no-metadata.
+
+version: 1
+
+database:
+  description: >
+    A small retail store: customers place orders, each order contains one or
+    more line items drawn from a product catalogue.
+
+  conventions:
+    amounts: >
+      Plain currency units as REAL (e.g. 999.99), not cents - no scaling needed.
+    dates: >
+      order_date and created_at are TEXT timestamps like
+      '2026-07-31 22:45:09.045016'. Compare them with SQLite date functions;
+      use date(order_date) when grouping by day.
+
+  glossary:
+    - term: revenue
+      means: >
+        The sum of orders.total_amount for orders that are not cancelled.
+        Cancelled orders keep their total, so they must be filtered out.
+    - term: basket size
+      means: The number of line items on an order, i.e. rows in order_items.
+    - term: open order
+      means: An order whose status is pending, processing or shipped.
+
+  rules:
+    - >
+      order_items.price is the UNIT price at the time of the order, not the line
+      total. Multiply by order_items.quantity to get the line total.
+    - >
+      Exclude cancelled orders when calculating revenue or averages, unless the
+      user asks about cancellations.
+    - >
+      orders.total_amount already equals the sum of quantity * price across the
+      order's items, so prefer it over re-aggregating order_items when the
+      question is only about order value.
+
+tables:
+  customers:
+    description: One row per customer. Everyone in the catalogue is US-based.
+    grain: customer
+    synonyms: [clients, buyers]
+    columns:
+      name:
+        description: Full name, as a single field
+        pii: true
+      email:
+        description: Contact address
+        pii: true
+      city:
+        description: City the customer is billed in
+      state:
+        description: US state, as a two-letter postal code
+        values:
+          CA: {label: California, synonyms: [Cali]}
+          NY: {label: New York}
+          IL: {label: Illinois}
+          TX: {label: Texas}
+          AZ: {label: Arizona}
+          PA: {label: Pennsylvania}
+      created_at:
+        description: When the customer record was created
+        semantic_type: timestamp
+
+  orders:
+    description: One row per order - the header, not the individual items.
+    grain: order
+    synonyms: [purchases, sales]
+    columns:
+      customer_id:
+        description: The customer who placed the order
+      order_date:
+        description: When the order was placed
+        semantic_type: timestamp
+        # Makes "last month" and "recently" resolve here rather than to
+        # customers.created_at or products.created_at.
+        default_time_column: true
+      total_amount:
+        description: Order value across all its line items
+        semantic_type: money
+      status:
+        description: Where the order has got to
+        values:
+          pending: {label: Pending, synonyms: [new, awaiting processing]}
+          processing: {label: Processing, synonyms: [being picked, in progress]}
+          shipped: {label: Shipped, synonyms: [dispatched, in transit, on its way]}
+          delivered: {label: Delivered, synonyms: [complete, completed, received]}
+          cancelled: {label: Cancelled, synonyms: [canceled, voided, called off]}
+
+  order_items:
+    description: >
+      One row per product on an order. An order with three different products
+      has three rows here.
+    grain: order line
+    synonyms: [line items, order lines]
+    columns:
+      order_id:
+        description: The order this line belongs to
+      product_id:
+        description: The product being bought
+      quantity:
+        description: How many units of the product
+      price:
+        description: >
+          Unit price at the time of the order, copied from the product. Multiply
+          by quantity for the line total.
+        semantic_type: money
+
+  products:
+    description: One row per product available to buy.
+    grain: product
+    synonyms: [catalogue, items, SKUs]
+    columns:
+      name:
+        description: Product name
+      category:
+        description: Broad product grouping
+        values:
+          Electronics: {label: Electronics, synonyms: [tech, gadgets]}
+          Furniture: {label: Furniture, synonyms: [desks and chairs]}
+          Accessories: {label: Accessories, synonyms: [add-ons, peripherals]}
+      price:
+        description: Current list price
+        semantic_type: money
+      stock:
+        description: Units currently on hand
+      created_at:
+        description: When the product was added to the catalogue
+        semantic_type: timestamp
+
+relationships:
+  # These three are already declared as foreign keys, so they'd be picked up
+  # automatically. They're spelled out here to add the notes - which is what
+  # tells the model that customers and products can only be connected by going
+  # through both order tables.
+  - from: orders.customer_id
+    to: customers.id
+    cardinality: many_to_one
+    note: one customer has many orders
+
+  - from: order_items.order_id
+    to: orders.id
+    cardinality: many_to_one
+    note: one order has many line items
+
+  - from: order_items.product_id
+    to: products.id
+    cardinality: many_to_one
+    note: >
+      the only path from products to customers is
+      products -> order_items -> orders -> customers

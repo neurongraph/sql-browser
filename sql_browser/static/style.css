@@ -94,6 +94,11 @@ aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; c
 .schema-cols .col-type { color: var(--muted); }
 .schema-cols .pk { color: var(--warn); }
 .schema-cols .enum { color: var(--muted); font-style: italic; }
+.schema-cols .col-desc { color: var(--muted); }
+.schema-cols .tbl-note { color: var(--muted); font-style: italic; white-space: normal; }
+.schema-cols.schema-rels li,
+.schema-cols.schema-warnings li { white-space: normal; }
+.schema-cols.schema-warnings li { color: var(--warn); }
 
 main { flex: 1; display: flex; flex-direction: column; overflow: hidden; padding: 0; }
 

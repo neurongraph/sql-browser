@@ -2,7 +2,14 @@
 
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from .logger import get_logger
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance
+    from .metadata import Metadata
+
+logger = get_logger(__name__)
 
 
 class DatabaseInspector:
@@ -21,6 +28,12 @@ class DatabaseInspector:
         self.connection: Optional[sqlite3.Connection] = None
         self._schema_cache: Optional[Dict[str, Any]] = None
         self.profile: Dict[str, Dict[str, Any]] = {}
+        #: Curated semantic layer (see metadata.py), populated by the caller
+        #: after connecting. None until then, and left None when disabled.
+        self.metadata: Optional["Metadata"] = None
+        #: Problems found reconciling that metadata against this schema, kept so
+        #: the CLI and web UI can surface them instead of only logging them.
+        self.metadata_warnings: List[str] = []
 
     def connect(self, check_same_thread: bool = True) -> None:
         """Establish connection to the database.
@@ -93,6 +106,58 @@ class DatabaseInspector:
                 'pk': bool(row[5])
             })
         return columns
+
+    def get_foreign_keys(self, table_name: str) -> List[Dict[str, str]]:
+        """Get the foreign keys declared on a table.
+
+        These are the join paths the database already knows about, and reading
+        them costs nothing - so a SQLite file with real constraints gets a join
+        graph without anyone writing metadata by hand.
+
+        Args:
+            table_name: Name of the table
+
+        Returns:
+            List of {'from': column, 'table': parent table, 'to': parent column}.
+            Empty for tables with no constraints - notably every table in a
+            workbook loaded from Excel, which is why relationships can also be
+            declared by hand in a metadata file.
+        """
+        if not self.connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(f'PRAGMA foreign_key_list("{table_name}")')
+            rows = cursor.fetchall()
+        except sqlite3.Error as e:
+            # A malformed constraint shouldn't cost us the whole join graph.
+            logger.debug(f"Could not read foreign keys for {table_name}: {e}")
+            return []
+
+        foreign_keys = []
+        for row in rows:
+            parent_table, from_column, to_column = row[2], row[3], row[4]
+            # `to` is NULL when the constraint references the parent's primary
+            # key implicitly (`REFERENCES customers` with no column).
+            if to_column is None:
+                to_column = self._primary_key_column(parent_table)
+                if to_column is None:
+                    continue
+            if not from_column:
+                continue
+            foreign_keys.append(
+                {"from": from_column, "table": parent_table, "to": to_column}
+            )
+        return foreign_keys
+
+    def _primary_key_column(self, table_name: str) -> Optional[str]:
+        """Return a table's single-column primary key, or None if there isn't one."""
+        try:
+            primary_keys = [col["name"] for col in self.get_table_schema(table_name) if col["pk"]]
+        except sqlite3.Error:
+            return None
+        return primary_keys[0] if len(primary_keys) == 1 else None
 
     def get_table_sample(self, table_name: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Get sample rows from a table.
@@ -198,49 +263,17 @@ class DatabaseInspector:
 
     def get_schema_description(self) -> str:
         """Get a human-readable description of the database schema.
-        
+
+        Composing this needs the profile, the declared foreign keys and any
+        curated metadata as well as the schema, so the rendering lives in
+        context.py; this stays as the entry point callers already use. Imported
+        lazily because that module needs this class in turn.
+
         Returns:
             Formatted string describing the database structure
         """
-        schema = self.get_full_schema()
-        
-        lines = ["Database Schema:\n"]
-        
-        for table_name, table_info in schema.items():
-            lines.append(f"\nTable: {table_name} ({table_info['row_count']} rows)")
-            lines.append("Columns:")
-            
-            column_profiles = self.profile.get(table_name, {})
-            for col in table_info['columns']:
-                pk_marker = " [PRIMARY KEY]" if col['pk'] else ""
-                null_marker = " NOT NULL" if col['notnull'] else ""
-                hint = self._format_profile_hint(column_profiles.get(col['name']))
-                lines.append(f"  - {col['name']}: {col['type']}{pk_marker}{null_marker}{hint}")
+        from .context import render_schema_context
 
-        return "\n".join(lines)
-
-    # Cap how many enum values are inlined into the LLM-facing schema text so a
-    # database with many categorical columns doesn't blow up the prompt size
-    # (the full list is still cached in `self.profile` for query correction).
-    MAX_ENUM_VALUES_IN_SCHEMA = 8
-
-    @staticmethod
-    def _format_profile_hint(column_profile: Optional[Dict[str, Any]]) -> str:
-        """Format a profiled column's known values/range as a schema hint."""
-        if not column_profile:
-            return ""
-
-        if column_profile["type"] == "enum":
-            values = column_profile["values"]
-            shown = values[:DatabaseInspector.MAX_ENUM_VALUES_IN_SCHEMA]
-            formatted = ", ".join(repr(v) for v in shown)
-            if len(values) > len(shown):
-                formatted += f", ... ({len(values) - len(shown)} more)"
-            return f" (values: {formatted})"
-
-        if column_profile["type"] == "range":
-            return f" (range: {column_profile['min']} to {column_profile['max']})"
-
-        return ""
+        return render_schema_context(self)
 
 # Made with Bob

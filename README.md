@@ -12,6 +12,7 @@ A natural language SQLite database explorer powered by local LLM (Ollama).
 - 🤖 Local LLM powered - uses Ollama (no API keys required)
 - 📈 Excel workbook support - open `.xlsx`/`.xlsm` files directly (each sheet becomes a table)
 - 🧭 Database profiling - learns each column's real values/ranges to guide the LLM
+- 📚 Metadata layer - describe your data's meaning, joins and business rules in a YAML sidecar; additive only, so it can never misrepresent the data
 - 🛡️ SQL safety layer (sqlglot) - dialect normalization, strict read-only validation, and schema-aware checks that catch hallucinated tables/columns before execution
 - 🔁 Self-repair - when a query references something that doesn't exist, the specific error is fed back for one automatic fix
 - 🎯 Value correction - detects guessed literal values that aren't in the data (`=`, `!=`, `IN (...)`, JOIN-aware) and lets you pick the real one
@@ -57,6 +58,10 @@ uv run sql-browser --model granite4.1:8b mydata.db
 uv run sql-browser --web --port 8137 mydata.db
 uv run sql-browser --no-profile mydata.db
 
+# Describe your data once so the LLM stops guessing (see "Metadata" below)
+uv run sql-browser --init-metadata mydata.db   # writes mydata.meta.yaml
+uv run sql-browser mydata.db                   # picked up automatically
+
 # Example queries:
 # - "Show me all tables"
 # - "What are the columns in the users table?"
@@ -84,6 +89,10 @@ just run-sample                    # build the sample DB and open it
 | `--port` | Port for the web UI (default `8000`, only used with `--web`) |
 | `--data-dir` | Where the web UI stores uploaded files (default `data/`) |
 | `--no-profile` | Skip profiling the database (column values/ranges) for text-to-SQL hints |
+| `--metadata` | Path to a metadata file, instead of looking for one next to the database |
+| `--no-metadata` | Ignore any sidecar metadata file (foreign keys are still read) |
+| `--init-metadata` | Write a starter metadata file next to the database and exit |
+| `--llm-draft` | With `--init-metadata`, have the LLM draft descriptions for you to correct |
 | `--version`, `-v` | Show version and exit |
 
 The `database` argument is required for the terminal REPL but optional with
@@ -135,10 +144,100 @@ While in the interactive terminal session:
 - `schema` - Display the complete database schema
 - `tables` - List all tables in the database
 - `profile` - Show (or refresh) profiled column values/ranges
+- `metadata` - Show the curated metadata layer and any warnings
 - `clear` - Clear conversation history
 - `logs` - Show logs directory location
 - `help` - Show help message
 - `exit` or `quit` - Exit the application
+
+## Metadata: describing what your data means
+
+Schema inspection and profiling tell the LLM what your database *is* — tables,
+types, the values each column actually holds. Neither can tell it what any of
+that *means*, and that's where a local model usually goes wrong: it doesn't know
+`status = 'S'` is what you call "shipped", that `orders` joins `customers`
+through `customer_id`, that amounts are stored in cents, or that test rows should
+always be excluded.
+
+So you can write it down once, in a YAML file next to your database:
+
+```bash
+uv run sql-browser --init-metadata mydata.db
+```
+
+That writes `mydata.meta.yaml` pre-filled with every table, every column, and
+the real categorical values found in each — you supply the meanings. Add
+`--llm-draft` to have the model take a first pass at the descriptions for you to
+correct. The file is discovered automatically from then on; run the `metadata`
+command in the REPL to see what was loaded.
+
+`examples/sample.meta.yaml` is a complete worked example:
+
+```yaml
+version: 1
+
+database:
+  description: A small retail store — customers place orders of line items.
+  conventions:
+    amounts: Plain currency units as REAL, not cents — no scaling needed.
+  glossary:
+    - term: revenue
+      means: Sum of orders.total_amount for orders that are not cancelled.
+  rules:
+    - order_items.price is the UNIT price, not the line total — multiply by quantity.
+
+tables:
+  orders:
+    description: One row per order — the header, not the individual items.
+    grain: order
+    synonyms: [purchases, sales]
+    columns:
+      order_date:
+        default_time_column: true          # what "last month" means
+      status:
+        values:
+          shipped: {label: Shipped, synonyms: [dispatched, in transit]}
+          cancelled: {label: Cancelled, synonyms: [voided]}
+
+relationships:                             # declared foreign keys are automatic
+  - from: order_items.order_id
+    to: orders.id
+    cardinality: many_to_one
+```
+
+What each part buys you:
+
+| Section | Effect |
+| --- | --- |
+| `relationships` | Correct JOINs. Read automatically from foreign keys; write them by hand where there are none — notably every Excel workbook |
+| `values` | "shipped" is rewritten to the stored code deterministically, instead of asking you to pick from a list of opaque codes |
+| `rules`, `conventions` | Standing corrections applied to every query without being asked |
+| `glossary` | "revenue" means one thing, consistently |
+| `description`, `grain` | Whether to count rows or count distinct keys |
+| `synonyms` | Your vocabulary maps onto the schema's |
+| `pii` | Flags columns not to select unless asked |
+
+### Metadata can never lie about your data
+
+The file is **additive, never authoritative**. Types and keys always come from
+the database, and the set of values a column contains always comes from the data
+itself — a `values:` entry only attaches a label to a code that already exists.
+Anything naming a table, column or value that isn't there is dropped and
+reported, not trusted:
+
+```
+⚠ orders.statuz: no such column - ignored
+⚠ orders.status: value(s) not present in the data - ignored: 'Z'
+```
+
+So a stale metadata file can make the prompt less helpful, but it can't make the
+tool assert something false about your data. Nothing that fails this check ever
+reaches the model. Missing files, unparseable YAML and drifted schemas all
+degrade to warnings — you always get a usable session.
+
+Everything in the file is optional; a half-filled-in file is normal and loads
+fine. Only the join graph comes free: declared foreign keys are read whether or
+not you write any metadata at all.
 
 ## How queries are made safe and accurate
 
@@ -213,6 +312,8 @@ uv run pytest --cov=sql_browser
 - **SQL Guard**: sqlglot-based dialect normalization, read-only validation, schema checks, and row-limit enforcement
 - **Value Correction**: AST-based detection/repair of guessed literal values
 - **Profiling**: Per-column value/range hints cached in the database to improve accuracy
+- **Metadata**: Curated semantic layer (YAML sidecar) reconciled against the real schema — additive only
+- **Context Rendering**: Composes schema + profile + foreign keys + metadata into the prompt
 - **Output Formatting**: Rich library for beautiful terminal output
 - **Logging**: Loguru for comprehensive debugging and monitoring
 
@@ -225,14 +326,21 @@ sql_browser/
 ├── web.py              # FastAPI backend for the web UI (file/model switching)
 ├── static/             # Web UI frontend (index.html, app.js, style.css)
 ├── config.py           # Settings from .env / environment (data dir, model)
-├── database.py         # Database operations and schema inspection
+├── database.py         # Database operations, schema + foreign key inspection
 ├── excel_loader.py     # Excel workbook -> temporary SQLite conversion
 ├── profiler.py         # Column value/range profiling (cached in the DB)
+├── metadata.py         # Curated metadata: load, reconcile, scaffold
+├── context.py          # Renders schema + profile + metadata into prompt text
 ├── llm.py              # LLM integration, translation + repair, with logging
 ├── sql_guard.py        # sqlglot safety layer (transpile/validate/limit)
 ├── query_corrector.py  # Detect & correct guessed literal filter values
 ├── query_executor.py   # Query execution and Rich formatting
 └── logger.py           # Logging configuration
+
+tests/                  # pytest suite (metadata reconciliation, prompt rendering)
+examples/
+├── create_sample_db.py # Builds sample.db
+└── sample.meta.yaml    # Worked example of a metadata file
 ```
 
 ## Troubleshooting

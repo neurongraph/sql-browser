@@ -36,6 +36,7 @@ from .database import DatabaseInspector
 from .excel_loader import EXCEL_EXTENSIONS, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator, list_models
 from .logger import get_logger
+from .metadata import resolve_metadata
 from .profiler import profile_database
 from .query_corrector import apply_value_choices, find_value_mismatches
 from .sql_guard import (
@@ -114,16 +115,27 @@ class BrowserSession:
     and a re-bind must not race a query.
     """
 
-    def __init__(self, model: str = DEFAULT_MODEL, profile: bool = True):
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        profile: bool = True,
+        metadata_path: Optional[Path] = None,
+        use_metadata: bool = True,
+    ):
         """Initialize an empty session (no database bound yet).
 
         Args:
             model: Ollama model to start with
             profile: Whether to profile a database when it's loaded, for
                 column value/range hints that improve text-to-SQL accuracy
+            metadata_path: An explicit metadata file for the pinned database,
+                bypassing sidecar discovery
+            use_metadata: Whether to look for a sidecar metadata file at all
         """
         self.lock = threading.RLock()
         self.profile_enabled = profile
+        self.metadata_path = metadata_path
+        self.use_metadata = use_metadata
         # Fails fast if Ollama isn't running - the whole app depends on it.
         self.llm = LLMQueryTranslator(model=model)
 
@@ -186,6 +198,18 @@ class BrowserSession:
                         logger.info(f"Profiling complete for {path.name}")
                     except Exception as e:
                         logger.warning(f"Profiling failed for {path.name}: {e}")
+
+                # Discovery keys off `path` - the workbook, not the temporary
+                # database converted from it. An explicit --metadata file only
+                # applies to the database it was passed alongside; a file picked
+                # later in the browser gets its own sidecar or none.
+                override = self.metadata_path if path == self.pinned_path else None
+                inspector.metadata, inspector.metadata_warnings = resolve_metadata(
+                    inspector,
+                    source_path=path,
+                    override=override,
+                    use_file=self.use_metadata,
+                )
 
                 schema_info = inspector.get_schema_description()
             except Exception:
@@ -370,6 +394,8 @@ def create_app(
     db_path: Optional[str] = None,
     model: Optional[str] = None,
     profile: bool = True,
+    metadata_path: Optional[Path] = None,
+    use_metadata: bool = True,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -378,11 +404,19 @@ def create_app(
             at startup and pre-select in the UI. Read in place, never copied.
         model: Ollama model to start with (defaults to the configured one)
         profile: Whether to profile a database when it's loaded, for value hints
+        metadata_path: An explicit metadata file for `db_path`, bypassing
+            sidecar discovery
+        use_metadata: Whether to look for a sidecar metadata file at all
 
     Returns:
         A configured FastAPI application.
     """
-    session = BrowserSession(model=model or DEFAULT_MODEL, profile=profile)
+    session = BrowserSession(
+        model=model or DEFAULT_MODEL,
+        profile=profile,
+        metadata_path=metadata_path,
+        use_metadata=use_metadata,
+    )
 
     if db_path:
         source = Path(db_path).expanduser().resolve()
@@ -519,18 +553,40 @@ def create_app(
         with session.lock:
             full_schema = session.inspector.get_full_schema()
             profile_data = session.inspector.profile
+            metadata = session.inspector.metadata
+            metadata_warnings = list(session.inspector.metadata_warnings)
         tables = []
         for name, info in full_schema.items():
+            table_meta = metadata.table(name) if metadata else None
             tables.append({
                 "name": name,
                 "row_count": info["row_count"],
+                "description": table_meta.description if table_meta else None,
+                "grain": table_meta.grain if table_meta else None,
                 "columns": [
-                    {"name": c["name"], "type": c["type"], "pk": c["pk"]}
+                    {
+                        "name": c["name"],
+                        "type": c["type"],
+                        "pk": c["pk"],
+                        "description": (
+                            metadata.column(name, c["name"]).description
+                            if metadata
+                            else None
+                        ),
+                    }
                     for c in info["columns"]
                 ],
                 "profile": profile_data.get(name, {}),
             })
-        return {"database": session.source_path.name, "tables": tables}
+        return {
+            "database": session.source_path.name,
+            "tables": tables,
+            "relationships": [
+                {"from": r.from_, "to": r.to, "declared": r.declared}
+                for r in (metadata.relationships if metadata else [])
+            ],
+            "metadata_warnings": metadata_warnings,
+        }
 
     @app.get("/api/suggestions")
     def get_suggestions() -> Dict[str, Any]:
@@ -627,9 +683,17 @@ def run_web(
     profile: bool = True,
     host: str = "127.0.0.1",
     port: int = 8000,
+    metadata_path: Optional[Path] = None,
+    use_metadata: bool = True,
 ) -> None:
     """Create the app and serve it with uvicorn (blocking)."""
-    app = create_app(db_path, model=model, profile=profile)
+    app = create_app(
+        db_path,
+        model=model,
+        profile=profile,
+        metadata_path=metadata_path,
+        use_metadata=use_metadata,
+    )
     print(f"\n  SQL Browser web UI running at  http://{host}:{port}\n  Press Ctrl+C to stop.\n")
     uvicorn.run(app, host=host, port=port, log_level="info")
 

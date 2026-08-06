@@ -276,6 +276,15 @@ IMPORTANT RULES:
 7. For "count" or "how many" queries, use COUNT()
 8. For "top" or "highest" queries, use ORDER BY with LIMIT
 9. Always use proper SQL formatting and indentation
+10. If a RULES section appears above, it is mandatory - apply every rule unless
+    the user's question explicitly overrides it
+11. If a RELATIONSHIPS section appears above, join only along the paths it lists.
+    To connect two tables that share no listed path, route through the tables
+    that do. Never invent a join key
+12. Where a column lists its values as 'CODE'=Meaning, filter on the code, never
+    on the meaning
+13. Honour the CONVENTIONS and GLOSSARY sections when they define how a value is
+    stored or what a term means
 
 EXAMPLE RESPONSES:
 
@@ -361,5 +370,91 @@ Example: {{"suggestions": ["Show me all users", "What is the total revenue?", ..
                 "How many rows are in each table?",
                 "What is the structure of the database?"
             ]
+
+    def draft_metadata(
+        self,
+        table: str,
+        columns: list,
+        column_profiles: Dict[str, Dict],
+        samples: list,
+    ) -> Dict[str, object]:
+        """Draft descriptions for one table, to seed a metadata file.
+
+        Called once per table rather than once per database: a small model asked
+        to describe thirty tables in a single JSON object tends to truncate or
+        drift, and a per-table call means one bad response costs one stanza
+        instead of the whole file.
+
+        The output is a starting point for a human to correct, never an
+        authority - it's written into the file as text the user then edits, and
+        it goes through the same reconciliation as hand-written metadata.
+
+        Args:
+            table: Table name
+            columns: Column dicts from DatabaseInspector.get_table_schema
+            column_profiles: Profiled values/ranges for this table's columns
+            samples: A few sample rows, to give the model something concrete
+
+        Returns:
+            Dict shaped like {"description": str, "grain": str,
+            "synonyms": [str], "columns": {name: {"description": str,
+            "values": {code: label}}}}, or an empty dict if the model failed
+        """
+        column_lines = []
+        for col in columns:
+            profile = column_profiles.get(col["name"])
+            hint = ""
+            if profile and profile.get("type") == "enum":
+                hint = f" - values seen: {profile['values'][:15]}"
+            elif profile and profile.get("type") == "range":
+                hint = f" - range {profile['min']} to {profile['max']}"
+            column_lines.append(f"  - {col['name']} ({col['type']}){hint}")
+
+        prompt = f"""You are documenting a database table for future analysts.
+
+Table: {table}
+Columns:
+{chr(10).join(column_lines)}
+
+Sample rows:
+{json.dumps(samples, indent=2, default=str)[:2000]}
+
+Write concise, factual documentation. Respond in JSON with exactly these fields:
+  "description": one sentence on what this table holds
+  "grain": what a single row represents, as a short noun phrase (e.g. "order", "order line")
+  "synonyms": up to 3 other words a user might call this table
+  "columns": an object mapping column name -> {{"description": one short phrase,
+             "values": an object mapping each code to its plain-English meaning,
+             ONLY for short codes whose meaning is not already obvious}}
+
+Omit anything you are not confident about. Do not invent columns or values that
+are not listed above."""
+
+        try:
+            logger.info(f"Requesting metadata draft for table '{table}'")
+            start = time.monotonic()
+            response = ollama.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                format="json",
+            )
+            logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
+
+            content = response["message"]["content"].strip()
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                result = json.loads(repair_json(content))
+
+            if not isinstance(result, dict):
+                logger.warning(f"Metadata draft for '{table}' was not an object")
+                return {}
+            return result
+
+        except Exception as e:
+            # A draft is a convenience; failing to get one must not stop the
+            # scaffold being written for the remaining tables.
+            logger.warning(f"Metadata draft failed for table '{table}': {e}")
+            return {}
 
 # Made with Bob
