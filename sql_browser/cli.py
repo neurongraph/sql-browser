@@ -13,6 +13,13 @@ from .llm import LLMQueryTranslator
 from .profiler import profile_database
 from .query_corrector import resolve_value_mismatches
 from .query_executor import QueryExecutor
+from .sql_guard import (
+    build_schema,
+    enforce_limit,
+    find_schema_problems,
+    is_read_only,
+    transpile_to_sqlite,
+)
 from .logger import get_logger, LOGS_DIR
 
 logger = get_logger(__name__)
@@ -21,7 +28,7 @@ logger = get_logger(__name__)
 class SQLBrowserSession:
     """Manages an interactive SQL Browser session."""
 
-    def __init__(self, db_path: str, model: str = "llama3.2", profile: bool = True):
+    def __init__(self, db_path: str, model: str = "gemma4:31b-cloud", profile: bool = True):
         """Initialize the session.
 
         Args:
@@ -152,25 +159,27 @@ class SQLBrowserSession:
                     sql = result['sql']
                     explanation = result['explanation']
                     confidence = result.get('confidence', 'medium')
-                    
-                    # Validate SQL
-                    if not self.llm.validate_sql(sql):
-                        self.executor.display_warning(
-                            "Generated query contains potentially unsafe operations. "
-                            "Only SELECT queries are allowed."
-                        )
-                        continue
-                    
+
                     # Show confidence warning for low confidence queries
                     if confidence == 'low':
                         self.executor.display_warning(
                             "Low confidence in this query. Please verify the results."
                         )
 
+                    # Deterministic guard: normalize dialect, enforce read-only,
+                    # and repair hallucinated tables/columns before executing.
+                    prepared = self._prepare_sql(user_input, schema_info, sql, explanation)
+                    if prepared is None:
+                        continue
+                    sql, explanation = prepared
+
                     # Check for guessed literal values that don't exist in the data
                     sql = resolve_value_mismatches(
                         sql, self.db_inspector, self._ask_value_choice
                     )
+
+                    # Cap unbounded result sets
+                    sql = enforce_limit(sql)
 
                     # Execute and display
                     logger.debug(f"Executing SQL: {sql}")
@@ -213,6 +222,52 @@ class SQLBrowserSession:
             except Exception as e:
                 logger.exception("Unexpected error in interaction loop")
                 self.executor.display_warning(f"Unexpected error: {e}")
+
+    def _prepare_sql(
+        self, user_input: str, schema_info: str, sql: str, explanation: str
+    ) -> Optional[tuple]:
+        """Normalize, validate, and (if needed) repair a generated query.
+
+        Transpiles the query to SQLite, rejects anything that isn't read-only,
+        and - when it references tables/columns that don't exist - asks the LLM
+        for a single repair using the specific error as a hint.
+
+        Returns:
+            (sql, explanation) ready to run, or None if the query was rejected.
+        """
+        sql = transpile_to_sqlite(sql)
+
+        if not is_read_only(sql):
+            self.executor.display_warning(
+                "Generated query contains potentially unsafe operations. "
+                "Only SELECT queries are allowed."
+            )
+            return None
+
+        problems = find_schema_problems(sql, build_schema(self.db_inspector))
+        if problems:
+            logger.info(f"Schema validation problems: {problems}")
+            self.executor.display_info("Refining query to match the schema...")
+            try:
+                with self.executor.console.status(
+                    "[cyan]Fixing query... (waiting for LLM)[/cyan]", spinner="dots"
+                ):
+                    repaired = self.llm.repair_sql(
+                        user_input,
+                        schema_info,
+                        sql,
+                        "; ".join(problems),
+                        self.conversation_history,
+                    )
+                candidate = transpile_to_sqlite(repaired["sql"])
+                if is_read_only(candidate):
+                    sql = candidate
+                    explanation = repaired.get("explanation", explanation)
+                    logger.info(f"Repaired SQL: {sql}")
+            except Exception as e:
+                logger.warning(f"SQL repair attempt failed: {e}")
+
+        return sql, explanation
 
     def _ask_value_choice(
         self, column: str, attempted_value: str, candidates: list
@@ -376,7 +431,7 @@ def cli(
         readable=True,
     ),
     model: str = typer.Option(
-        "llama3.2",
+        "gemma4:31b-cloud",
         "--model",
         "-m",
         help="Ollama model to use",
@@ -385,6 +440,16 @@ def cli(
         False,
         "--no-profile",
         help="Skip profiling the database (column values/ranges) for text-to-SQL hints",
+    ),
+    web: bool = typer.Option(
+        False,
+        "--web",
+        help="Launch the browser-based UI instead of the terminal REPL",
+    ),
+    port: int = typer.Option(
+        8000,
+        "--port",
+        help="Port for the web UI (only used with --web)",
     ),
     version: Optional[bool] = typer.Option(
         None,
@@ -406,9 +471,22 @@ def cli(
       \b
       sql-browser mydata.db
       sql-browser mydata.xlsx
-      sql-browser --model llama3.1 mydata.db
+      sql-browser --model gemma4:31b-cloud mydata.db
       sql-browser --no-profile mydata.db
+      sql-browser --web mydata.db
     """
+    # Launch the web UI instead of the terminal REPL
+    if web:
+        from .web import run_web
+
+        run_web(
+            str(database),
+            model=model,
+            profile=not no_profile,
+            port=port,
+        )
+        return
+
     # Start session
     try:
         session = SQLBrowserSession(str(database), model=model, profile=not no_profile)

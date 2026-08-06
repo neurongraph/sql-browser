@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 class LLMQueryTranslator:
     """Translates natural language queries to SQL using Ollama."""
 
-    def __init__(self, model: str = "llama3.2"):
+    def __init__(self, model: str = "gemma4:31b-cloud"):
         """Initialize the LLM translator.
         
         Args:
@@ -66,15 +66,63 @@ class LLMQueryTranslator:
             "role": "user",
             "content": natural_query
         })
-        
+
+        logger.debug(f"Natural query: {natural_query}")
+        return self._request_sql(messages)
+
+    def repair_sql(
+        self,
+        natural_query: str,
+        schema_info: str,
+        failed_sql: str,
+        error: str,
+        conversation_history: Optional[list] = None,
+    ) -> Dict[str, str]:
+        """Ask the LLM to fix a query that failed validation or execution.
+
+        Feeds the failed SQL and the specific error back so the model can
+        correct a hallucinated column/table or a bad expression, rather than
+        regenerating blind.
+
+        Args:
+            natural_query: The user's original question
+            schema_info: Database schema information
+            failed_sql: The query that failed
+            error: The error/validation message describing what went wrong
+            conversation_history: Previous conversation for context
+
+        Returns:
+            Dictionary with 'sql', 'explanation' and 'confidence' keys
+        """
+        messages = [{"role": "system", "content": self._build_system_prompt(schema_info)}]
+        if conversation_history:
+            messages.extend(conversation_history)
+        messages.append({"role": "user", "content": natural_query})
+        messages.append({"role": "assistant", "content": json.dumps({"sql": failed_sql})})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"That query is invalid:\n{error}\n\n"
+                "Fix it. Use ONLY the tables and columns listed in the schema above. "
+                "Respond in the same JSON format."
+            ),
+        })
+
+        logger.info(f"Requesting SQL repair. Error: {error}")
+        return self._request_sql(messages)
+
+    def _request_sql(self, messages: list) -> Dict[str, str]:
+        """Send a chat request expecting a JSON SQL response and parse it.
+
+        Shared by translate_to_sql and repair_sql: performs the Ollama call,
+        parses (and repairs) the JSON response, and validates its structure.
+        """
         try:
-            # Log the request
             prompt_chars = sum(len(m["content"]) for m in messages)
             logger.info(
                 f"Sending request to Ollama model: {self.model} "
                 f"(prompt ~{prompt_chars} chars, ~{prompt_chars // 4} tokens)"
             )
-            logger.debug(f"Natural query: {natural_query}")
             logger.debug(f"Messages: {json.dumps(messages, indent=2)}")
 
             start = time.monotonic()
@@ -92,15 +140,15 @@ class LLMQueryTranslator:
             except Exception as e:
                 logger.debug(f"Could not serialize response for logging: {e}")
                 logger.debug(f"Response type: {type(response)}")
-            
+
             content = response['message']['content'].strip()
             logger.debug(f"Response content: {content}")
-            
+
             # Handle empty response
             if not content:
                 logger.error("LLM returned empty response")
                 raise ValueError("LLM returned empty response")
-            
+
             # Strip markdown code blocks if present
             if content.startswith('```'):
                 logger.debug("Removing markdown code block wrapper")
@@ -112,7 +160,7 @@ class LLMQueryTranslator:
                     lines = lines[:-1]  # Remove last line
                 content = '\n'.join(lines).strip()
                 logger.debug(f"Content after removing markdown: {content}")
-            
+
             # Try to parse JSON with standard parser first
             try:
                 result = json.loads(content)
@@ -120,7 +168,7 @@ class LLMQueryTranslator:
             except json.JSONDecodeError as e:
                 logger.warning(f"Standard JSON parsing failed: {e}")
                 logger.debug(f"Content that failed standard parsing: {content}")
-                
+
                 # Try to repair and parse the JSON
                 try:
                     logger.info("Attempting to repair malformed JSON...")
@@ -139,7 +187,7 @@ class LLMQueryTranslator:
                         f"Repair error: {repair_error}\n"
                         f"Response was: {content[:200]}..."
                     )
-            
+
             # Validate response structure
             if 'sql' not in result:
                 logger.error(f"LLM response missing 'sql' field. Keys: {list(result.keys())}")
@@ -147,19 +195,19 @@ class LLMQueryTranslator:
                     f"LLM response missing 'sql' field. "
                     f"Response keys: {list(result.keys())}"
                 )
-            
+
             sql_result = {
                 'sql': result.get('sql', ''),
                 'explanation': result.get('explanation', 'No explanation provided'),
                 'confidence': result.get('confidence', 'medium')
             }
-            
+
             logger.info(f"Successfully translated query to SQL: {sql_result['sql']}")
             logger.debug(f"Explanation: {sql_result['explanation']}")
             logger.debug(f"Confidence: {sql_result['confidence']}")
-            
+
             return sql_result
-            
+
         except json.JSONDecodeError as e:
             logger.exception("JSON decode error")
             raise ValueError(f"Failed to parse LLM response as JSON: {e}")
@@ -224,28 +272,22 @@ User: "What's the average price?"
 Now, convert the user's natural language query to SQL following these rules."""
 
     def validate_sql(self, sql: str) -> bool:
-        """Basic validation of SQL query.
-        
+        """Return True if the query is a single read-only SELECT.
+
+        Delegates to the sqlglot-based guard, which parses the query rather
+        than scanning for keywords - so it won't false-reject a column named
+        ``created_at`` and it rejects stacked statements like
+        ``SELECT ...; DROP TABLE x``.
+
         Args:
             sql: SQL query to validate
-            
+
         Returns:
-            True if query appears valid, False otherwise
+            True if query is read-only, False otherwise
         """
-        # Basic checks
-        sql_upper = sql.strip().upper()
-        
-        # Must start with SELECT (read-only queries)
-        if not sql_upper.startswith('SELECT'):
-            return False
-        
-        # Should not contain dangerous keywords
-        dangerous_keywords = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE']
-        for keyword in dangerous_keywords:
-            if keyword in sql_upper:
-                return False
-        
-        return True
+        from .sql_guard import is_read_only
+
+        return is_read_only(sql)
 
     def get_query_suggestions(self, schema_info: str) -> list[str]:
         """Generate example queries based on the schema.

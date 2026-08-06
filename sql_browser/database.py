@@ -22,9 +22,17 @@ class DatabaseInspector:
         self._schema_cache: Optional[Dict[str, Any]] = None
         self.profile: Dict[str, Dict[str, Any]] = {}
 
-    def connect(self) -> None:
-        """Establish connection to the database."""
-        self.connection = sqlite3.connect(str(self.db_path))
+    def connect(self, check_same_thread: bool = True) -> None:
+        """Establish connection to the database.
+
+        Args:
+            check_same_thread: Passed to sqlite3.connect. The web server serves
+                requests from a thread pool, so it connects with this set to
+                False (and serializes access with a lock).
+        """
+        self.connection = sqlite3.connect(
+            str(self.db_path), check_same_thread=check_same_thread
+        )
         self.connection.row_factory = sqlite3.Row
 
     def disconnect(self) -> None:

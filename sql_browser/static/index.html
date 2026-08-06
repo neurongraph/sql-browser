@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQL Browser</title>
+  <link rel="stylesheet" href="/static/style.css?v=3" />
+</head>
+<body>
+  <header>
+    <h1>SQL Browser</h1>
+    <span id="db-name" class="db-name"></span>
+  </header>
+
+  <div class="layout">
+    <aside id="sidebar">
+      <h2>Schema</h2>
+      <div id="schema-tree" class="schema-tree">Loading…</div>
+    </aside>
+
+    <main>
+      <div id="history" class="history"></div>
+
+      <section class="ask">
+        <div id="suggestions" class="suggestions"></div>
+        <form id="ask-form">
+          <input
+            id="nl-input"
+            type="text"
+            placeholder="Ask a question about your data…"
+            autocomplete="off"
+          />
+          <button type="submit" id="ask-btn">Ask</button>
+        </form>
+      </section>
+    </main>
+
+    <template id="turn-template">
+      <article class="turn">
+        <div class="turn-q"><span class="q-icon">🔍</span> <span class="q-text"></span></div>
+
+        <section class="sql-section hidden">
+          <div class="sql-header">
+            <span class="explanation"></span>
+            <span class="confidence"></span>
+          </div>
+          <textarea class="sql-box" spellcheck="false" rows="4"></textarea>
+          <div class="sql-actions">
+            <button type="button" class="run-btn">Run SQL</button>
+          </div>
+        </section>
+
+        <section class="picker-section hidden">
+          <h3>Some values weren't found in the data</h3>
+          <div class="picker-list"></div>
+          <button type="button" class="apply-btn">Apply &amp; Run</button>
+        </section>
+
+        <section class="status hidden"></section>
+
+        <section class="results-section hidden">
+          <div class="results-meta"></div>
+          <div class="table-wrap">
+            <table class="results-table"></table>
+          </div>
+        </section>
+      </article>
+    </template>
+  </div>
+
+  <script src="/static/app.js?v=3"></script>
+</body>
+</html>

@@ -6,7 +6,7 @@
    ```bash
    # Visit https://ollama.ai/ and follow installation instructions
    # Then pull a model:
-   ollama pull gemma4:31b
+   ollama pull gemma4:31b-cloud
    ```
 
 2. **Install dependencies**:
@@ -21,8 +21,39 @@
 
 4. **Run SQL Browser**:
    ```bash
+   # Terminal REPL
    uv run sql-browser sample.db
+
+   # Or launch the browser-based web UI
+   uv run sql-browser --web sample.db
    ```
+
+## Interfaces
+
+SQL Browser has two front-ends over the same core engine:
+
+- **Terminal REPL** (default) - type questions at the `🔍` prompt, get
+  Rich-formatted tables, use special commands like `schema` and `profile`.
+- **Web UI** (`--web`) - a localhost browser app with a schema sidebar,
+  suggestion chips, an **editable** SQL box, a results table, and a value picker
+  for correcting guessed filter values. Open the printed URL (default
+  http://127.0.0.1:8000); change it with `--port`.
+
+Both accept a SQLite database **or** an Excel workbook (`.xlsx`/`.xlsm`), where
+each sheet is loaded as a table into a temporary SQLite database for the session:
+
+```bash
+uv run sql-browser sales.xlsx
+uv run sql-browser --web sales.xlsx
+```
+
+With `just`:
+
+```bash
+just run mydata.db                 # terminal REPL
+just web mydata.db                 # web UI (default model, port 8000)
+just web mydata.xlsx granite4.1:8b 8137 # web UI with custom model + port
+```
 
 ## Example Queries
 
@@ -58,11 +89,13 @@ Once the application is running, you can ask questions in natural language:
 
 ## Special Commands
 
-While in the interactive session:
+While in the interactive terminal session:
 
 - `schema` - Display the complete database schema
 - `tables` - List all tables in the database
+- `profile` - Show (or refresh) profiled column values/ranges
 - `clear` - Clear conversation history
+- `logs` - Show logs directory location
 - `help` - Show help message
 - `exit` or `quit` - Exit the application
 
@@ -80,32 +113,43 @@ While in the interactive session:
    - Review the generated SQL to ensure it matches your intent
 
 4. **Read-Only**: Only SELECT queries are allowed for safety
-   - No INSERT, UPDATE, DELETE, or DROP operations
+   - Queries are parsed and validated; INSERT/UPDATE/DELETE/DROP and stacked
+     statements are rejected
+   - This applies to SQL you type or edit yourself in the web UI too
 
 5. **Schema Awareness**: Use `schema` command to see available tables and columns
    - Helps you ask more accurate questions
+
+6. **Value Correction**: If the model filters on a value that isn't in your data
+   (e.g. `status = 'Opne'`), SQL Browser detects it and either auto-corrects a
+   close match or offers you the real values to choose from - a prompt in the
+   terminal, a picker in the web UI. Works with `=`, `!=`, and `IN (...)`, and
+   is JOIN-aware.
+
+7. **Profiling**: On startup, low-cardinality columns and numeric ranges are
+   profiled and shown to the model as hints, which sharpens value accuracy.
+   Skip it with `--no-profile`, or refresh it with the `profile` command.
 
 ## Using Different Models
 
 You can specify a different Ollama model:
 
 ```bash
-uv run sql-browser --model llama3.1 sample.db
+uv run sql-browser --model granite4.1:8b sample.db
 ```
 
 Available models (must be pulled first with `ollama pull <model>`):
-- `llama3.2` (default, recommended)
-- `llama3.1`
-- `codellama`
-- `mistral`
-- `mixtral`
+- `gemma4:31b-cloud` (default, recommended)
+- `gemma4:e4b`
+- `granite4.1:8b`
+- `phi4`
 
 ## Troubleshooting
 
 ### "Failed to connect to Ollama"
 - Make sure Ollama is running: `ollama serve`
 - Check if the model is available: `ollama list`
-- Pull the model if needed: `ollama pull llama3.2`
+- Pull the model if needed: `ollama pull gemma4:31b-cloud`
 
 ### "Database file not found"
 - Verify the path to your database file
@@ -124,41 +168,65 @@ Available models (must be pulled first with `ollama pull <model>`):
 
 ## Advanced Usage
 
-### Using with Your Own Database
+### Using with Your Own Database or Workbook
 
 ```bash
 uv run sql-browser /path/to/your/database.db
+uv run sql-browser /path/to/your/workbook.xlsx      # sheets -> tables
+uv run sql-browser --web /path/to/your/database.db  # browser UI
 ```
 
 ### Programmatic Usage
 
-You can also use SQL Browser as a library:
+You can also use SQL Browser as a library. The example below wires in the same
+safety pipeline the CLI and web UI use:
 
 ```python
 from sql_browser.database import DatabaseInspector
 from sql_browser.llm import LLMQueryTranslator
 from sql_browser.query_executor import QueryExecutor
+from sql_browser.query_corrector import resolve_value_mismatches
+from sql_browser.sql_guard import (
+    build_schema, transpile_to_sqlite, is_read_only,
+    find_schema_problems, enforce_limit,
+)
 
-# Initialize components
 db = DatabaseInspector("mydata.db")
-llm = LLMQueryTranslator(model="llama3.2")
+llm = LLMQueryTranslator(model="gemma4:31b-cloud")
 
 with db:
     executor = QueryExecutor(db)
-    schema = db.get_schema_description()
-    
-    # Translate natural language to SQL
-    result = llm.translate_to_sql(
-        "Show me all customers",
-        schema
+    schema_info = db.get_schema_description()
+
+    # 1. Translate natural language to SQL
+    result = llm.translate_to_sql("Show me all customers", schema_info)
+    sql = transpile_to_sqlite(result["sql"])
+
+    # 2. Reject anything that isn't read-only
+    if not is_read_only(sql):
+        raise ValueError("Only read-only SELECT queries are allowed")
+
+    # 3. Catch hallucinated tables/columns; repair once if needed
+    problems = find_schema_problems(sql, build_schema(db))
+    if problems:
+        repaired = llm.repair_sql(
+            "Show me all customers", schema_info, sql, "; ".join(problems)
+        )
+        sql = transpile_to_sqlite(repaired["sql"])
+
+    # 4. Correct guessed literal values (auto-picks the first candidate here)
+    sql = resolve_value_mismatches(
+        sql, db, ask_choice=lambda col, val, candidates: candidates[0]
     )
-    
-    # Execute and display
-    executor.execute_and_display(
-        result['sql'],
-        result['explanation']
-    )
+
+    # 5. Cap unbounded results, then execute
+    executor.execute_and_display(enforce_limit(sql), result["explanation"])
 ```
+
+### Embedding the web app
+
+`sql_browser.web.create_app(db_path, model=..., profile=...)` returns a FastAPI
+app you can serve yourself, and `run_web(db_path, ...)` starts uvicorn for you.
 
 ## Examples with Sample Database
 

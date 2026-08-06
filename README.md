@@ -1,4 +1,5 @@
 
+
 # SQL Browser
 
 A natural language SQLite database explorer powered by local LLM (Ollama).
@@ -6,10 +7,15 @@ A natural language SQLite database explorer powered by local LLM (Ollama).
 ## Features
 
 - 🗣️ Natural language queries - ask questions in plain English
+- 🖥️ Two interfaces - a rich terminal REPL **and** a browser-based web UI (`--web`)
 - 🔍 Automatic schema inspection - understands your database structure
 - 🤖 Local LLM powered - uses Ollama (no API keys required)
+- 📈 Excel workbook support - open `.xlsx`/`.xlsm` files directly (each sheet becomes a table)
+- 🧭 Database profiling - learns each column's real values/ranges to guide the LLM
+- 🛡️ SQL safety layer (sqlglot) - dialect normalization, strict read-only validation, and schema-aware checks that catch hallucinated tables/columns before execution
+- 🔁 Self-repair - when a query references something that doesn't exist, the specific error is fed back for one automatic fix
+- 🎯 Value correction - detects guessed literal values that aren't in the data (`=`, `!=`, `IN (...)`, JOIN-aware) and lets you pick the real one
 - 📊 Rich CLI output - formatted tables and results
-- ✅ Query validation and error handling
 - 📝 Comprehensive logging with Loguru - debug issues easily
 
 ## Prerequisites
@@ -20,10 +26,10 @@ A natural language SQLite database explorer powered by local LLM (Ollama).
 
 ## Installation
 
-1. Install Ollama and pull a model:
+1. Install Ollama and pull the model:
 ```bash
 # Install Ollama from https://ollama.ai/
-ollama pull llama3.2
+ollama pull gemma4:31b-cloud
 ```
 
 2. Install the project:
@@ -34,8 +40,19 @@ uv sync
 ## Usage
 
 ```bash
-# Run the SQL browser
+# Run the terminal REPL against a SQLite database
 uv run sql-browser path/to/your/database.db
+
+# Open an Excel workbook (each sheet is loaded as a table)
+uv run sql-browser path/to/your/workbook.xlsx
+
+# Launch the browser-based web UI instead of the terminal
+uv run sql-browser --web path/to/your/database.db
+
+# Pick a different model, port, or skip profiling
+uv run sql-browser --model granite4.1:8b mydata.db
+uv run sql-browser --web --port 8137 mydata.db
+uv run sql-browser --no-profile mydata.db
 
 # Example queries:
 # - "Show me all tables"
@@ -44,16 +61,77 @@ uv run sql-browser path/to/your/database.db
 # - "Show me the top 10 products by price"
 ```
 
+### With `just`
+
+```bash
+just run mydata.db                 # terminal REPL
+just run-no-profile mydata.db      # skip profiling
+just web mydata.db                 # web UI (default model, port 8000)
+just web mydata.xlsx granite4.1:8b 8137 # web UI with custom model + port
+just run-sample                    # build the sample DB and open it
+```
+
+### Command-line options
+
+| Option | Description |
+| --- | --- |
+| `--model`, `-m` | Ollama model to use (default `gemma4:31b-cloud`) |
+| `--web` | Launch the browser-based UI instead of the terminal REPL |
+| `--port` | Port for the web UI (default `8000`, only used with `--web`) |
+| `--no-profile` | Skip profiling the database (column values/ranges) for text-to-SQL hints |
+| `--version`, `-v` | Show version and exit |
+
+## Web UI
+
+Run with `--web` and open the printed URL (default http://127.0.0.1:8000). It is
+localhost-only and single-user. The interface provides:
+
+- A **schema sidebar** listing tables and columns (with profiled value/range hints).
+- A pinned **natural-language box** and clickable **suggestion chips**.
+- A **scrollable transcript**: each question appends a new entry with its own
+  generated **SQL in an editable box** (tweak it and re-run with **Run SQL**) and
+  its own **results table**, so you can scroll back through everything you asked.
+- A **value picker**: when the model guesses a filter value that isn't in the
+  data, the UI shows the real candidate values so you can pick one and re-run.
+
+Every query - whether generated or hand-edited - passes through the same
+read-only safety checks as the CLI, and unbounded results are capped with a
+`LIMIT` automatically.
+
 ## Special Commands
 
-While in the interactive session:
+While in the interactive terminal session:
 
 - `schema` - Display the complete database schema
 - `tables` - List all tables in the database
+- `profile` - Show (or refresh) profiled column values/ranges
 - `clear` - Clear conversation history
 - `logs` - Show logs directory location
 - `help` - Show help message
 - `exit` or `quit` - Exit the application
+
+## How queries are made safe and accurate
+
+Between the model generating SQL and the query running, SQL Browser applies a
+deterministic pipeline (shared by the CLI and web UI):
+
+1. **Dialect normalization** - the query is transpiled to SQLite via
+   [sqlglot](https://github.com/tobymao/sqlglot), fixing cross-dialect idioms.
+2. **Read-only validation** - the query is *parsed* (not keyword-scanned) and
+   rejected unless it's a single read-only `SELECT`/`UNION`. This blocks stacked
+   statements like `SELECT ...; DROP TABLE x` and no longer false-rejects
+   columns such as `created_at`/`updated_at`.
+3. **Schema-aware check + repair** - columns and tables are bound against the
+   real schema. If the model hallucinated a name, the specific error is fed back
+   for a single automatic repair attempt.
+4. **Value correction** - literal filter values (`=`, `!=`/`<>`, `IN (...)`,
+   JOIN-aware) that don't exist in the column are detected. Close matches (e.g.
+   `'open'` vs `'Open'`) are auto-corrected; ambiguous ones prompt you to pick a
+   real value (a terminal prompt in the CLI, a picker in the web UI).
+5. **Row cap** - a `LIMIT` is injected into unbounded top-level `SELECT`s.
+
+Each step degrades gracefully: if a query can't be parsed, it falls back rather
+than blocking an otherwise-valid query.
 
 ## Logging
 
@@ -98,8 +176,13 @@ uv run pytest --cov=sql_browser
 ## Architecture
 
 - **CLI Interface**: Typer-based command line interface with Rich formatting
+- **Web Interface**: FastAPI backend + vanilla HTML/JS/CSS frontend (no build step)
 - **Database Layer**: SQLite connection and schema inspection
-- **LLM Integration**: Ollama for natural language to SQL translation
+- **Excel Support**: Workbooks converted to a temporary SQLite database (openpyxl)
+- **LLM Integration**: Ollama for natural language to SQL translation, with a repair loop
+- **SQL Guard**: sqlglot-based dialect normalization, read-only validation, schema checks, and row-limit enforcement
+- **Value Correction**: AST-based detection/repair of guessed literal values
+- **Profiling**: Per-column value/range hints cached in the database to improve accuracy
 - **Output Formatting**: Rich library for beautiful terminal output
 - **Logging**: Loguru for comprehensive debugging and monitoring
 
@@ -108,11 +191,17 @@ uv run pytest --cov=sql_browser
 ```
 sql_browser/
 ├── __init__.py
-├── cli.py              # CLI entry point with Typer
-├── database.py         # Database operations
-├── llm.py             # LLM integration with logging
-├── query_executor.py  # Query execution and formatting
-└── logger.py          # Logging configuration
+├── cli.py              # CLI entry point with Typer (--web launches the UI)
+├── web.py              # FastAPI backend for the web UI
+├── static/             # Web UI frontend (index.html, app.js, style.css)
+├── database.py         # Database operations and schema inspection
+├── excel_loader.py     # Excel workbook -> temporary SQLite conversion
+├── profiler.py         # Column value/range profiling (cached in the DB)
+├── llm.py              # LLM integration, translation + repair, with logging
+├── sql_guard.py        # sqlglot safety layer (transpile/validate/limit)
+├── query_corrector.py  # Detect & correct guessed literal filter values
+├── query_executor.py   # Query execution and Rich formatting
+└── logger.py           # Logging configuration
 ```
 
 ## Troubleshooting
@@ -120,7 +209,7 @@ sql_browser/
 ### "Failed to connect to Ollama"
 - Make sure Ollama is running: `ollama serve`
 - Check if the model is available: `ollama list`
-- Pull the model if needed: `ollama pull llama3.2`
+- Pull the model if needed: `ollama pull gemma4:31b-cloud`
 
 ### "Database file not found"
 - Verify the path to your database file
@@ -130,7 +219,7 @@ sql_browser/
 ### JSON Parsing Errors
 - Check the logs: `~/.sql_browser/logs/`
 - Logs will show the exact prompt sent to LLM and response received
-- Try a different model: `uv run sql-browser --model llama3.1 mydata.db`
+- Try a different model: `uv run sql-browser --model granite4.1:8b mydata.db`
 - Ensure Ollama is properly configured and running
 
 ### Low Quality Results
@@ -149,15 +238,14 @@ sql_browser/
 You can specify a different Ollama model:
 
 ```bash
-uv run sql-browser --model llama3.1 sample.db
+uv run sql-browser --model granite4.1:8b sample.db
 ```
 
 Available models (must be pulled first with `ollama pull <model>`):
-- `llama3.2` (default, recommended)
-- `llama3.1`
-- `codellama`
-- `mistral`
-- `mixtral`
+- `gemma4:31b-cloud` (default, recommended)
+- `gemma4:e4b`
+- `granite4.1:8b`
+- `phi4`
 
 ## Example Session
 
