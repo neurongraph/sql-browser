@@ -107,21 +107,28 @@ class DatabaseInspector:
             })
         return columns
 
-    def get_foreign_keys(self, table_name: str) -> List[Dict[str, str]]:
-        """Get the foreign keys declared on a table.
+    def get_foreign_keys(self, table_name: str) -> List[Dict[str, Any]]:
+        """Get the foreign key constraints declared on a table.
 
         These are the join paths the database already knows about, and reading
         them costs nothing - so a SQLite file with real constraints gets a join
         graph without anyone writing metadata by hand.
 
+        One entry per *constraint*, not per column. ``PRAGMA foreign_key_list``
+        returns one row per column, with the columns of a composite key sharing
+        an ``id`` and distinguished by ``seq``; grouping them back together is
+        essential, because a composite key joined on only one of its columns
+        fans out and silently returns wrong rows.
+
         Args:
             table_name: Name of the table
 
         Returns:
-            List of {'from': column, 'table': parent table, 'to': parent column}.
-            Empty for tables with no constraints - notably every table in a
-            workbook loaded from Excel, which is why relationships can also be
-            declared by hand in a metadata file.
+            List of {'table': parent table, 'columns': [(child col, parent col)]}
+            with the column pairs in declaration order. Empty for tables with no
+            constraints - notably every table in a workbook loaded from Excel,
+            which is why relationships can also be declared by hand in a
+            metadata file.
         """
         if not self.connection:
             raise RuntimeError("Database not connected")
@@ -135,29 +142,64 @@ class DatabaseInspector:
             logger.debug(f"Could not read foreign keys for {table_name}: {e}")
             return []
 
-        foreign_keys = []
+        # Group by constraint id, preserving both constraint and column order.
+        constraints: Dict[Any, Dict[str, Any]] = {}
         for row in rows:
-            parent_table, from_column, to_column = row[2], row[3], row[4]
+            constraint_id, seq, parent_table = row[0], row[1], row[2]
+            from_column, to_column = row[3], row[4]
+
             # `to` is NULL when the constraint references the parent's primary
-            # key implicitly (`REFERENCES customers` with no column).
+            # key implicitly (`REFERENCES customers` with no column list).
             if to_column is None:
-                to_column = self._primary_key_column(parent_table)
-                if to_column is None:
-                    continue
-            if not from_column:
+                to_column = self._implicit_parent_column(parent_table, seq)
+            if not from_column or not to_column:
+                logger.debug(
+                    f"Skipping unresolvable foreign key on {table_name} "
+                    f"(constraint {constraint_id}, seq {seq})"
+                )
+                constraints.pop(constraint_id, None)
                 continue
+
+            entry = constraints.setdefault(
+                constraint_id, {"table": parent_table, "columns": []}
+            )
+            entry["columns"].append((seq, from_column, to_column))
+
+        foreign_keys = []
+        for entry in constraints.values():
+            ordered = sorted(entry["columns"], key=lambda c: c[0])
             foreign_keys.append(
-                {"from": from_column, "table": parent_table, "to": to_column}
+                {
+                    "table": entry["table"],
+                    "columns": [(child, parent) for _, child, parent in ordered],
+                }
             )
         return foreign_keys
 
-    def _primary_key_column(self, table_name: str) -> Optional[str]:
-        """Return a table's single-column primary key, or None if there isn't one."""
+    def _implicit_parent_column(self, table_name: str, seq: int) -> Optional[str]:
+        """Resolve the parent column of a constraint that names no column list.
+
+        `REFERENCES customers` targets the parent's primary key, so the column
+        at position `seq` of that key is the one this constraint column pairs
+        with. Returns None if the parent has no usable primary key, which makes
+        the caller drop the constraint rather than guess at it.
+
+        Reads `PRAGMA table_info` directly rather than going through
+        get_table_schema(), because that coerces the `pk` field to a bool and
+        here its value matters: for a composite primary key it's the 1-based
+        position of the column within the key, which is what pairs it with `seq`.
+        """
+        cursor = self.connection.cursor()
         try:
-            primary_keys = [col["name"] for col in self.get_table_schema(table_name) if col["pk"]]
+            cursor.execute(f'PRAGMA table_info("{table_name}")')
+            rows = cursor.fetchall()
         except sqlite3.Error:
             return None
-        return primary_keys[0] if len(primary_keys) == 1 else None
+
+        key_columns = sorted(
+            ((row[5], row[1]) for row in rows if row[5]), key=lambda c: c[0]
+        )
+        return key_columns[seq][1] if seq < len(key_columns) else None
 
     def get_table_sample(self, table_name: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Get sample rows from a table.

@@ -4,10 +4,11 @@ Enhancements deferred from the metadata layer (Phase 1), plus gaps found while
 building and verifying it. Roughly ordered by value per unit of work within each
 priority band.
 
-Phase 1 delivered: declared foreign keys, curated YAML sidecar (descriptions,
-value dictionaries, synonyms, grain, join paths, glossary, conventions, rules),
-additive-only reconciliation, label→code resolution in the query corrector, and
-`--init-metadata` scaffolding.
+Phase 1 delivered: declared foreign keys (including composite keys, grouped so a
+single-column join on them is never presented as valid), curated YAML sidecar
+(descriptions, value dictionaries, synonyms, grain, join paths, glossary,
+conventions, rules), additive-only reconciliation, label→code resolution in the
+query corrector, mid-session metadata reload, and `--init-metadata` scaffolding.
 
 ---
 
@@ -139,7 +140,14 @@ intended one.
 
 `gemma4:31b-cloud` gets it right, so this is model capacity rather than a design
 flaw — but it's the most likely residual failure mode for small models, and the
-metadata to catch it already exists. Possible approaches, none obviously right:
+metadata to catch it already exists.
+
+Note the *metadata-caused* version of this is already handled: a label or synonym
+claimed by two codes is reported at load time and `resolve_label()` declines to
+rewrite it, so the corrector can no longer turn an ambiguous phrase into a
+wrong-but-valid code on its own. What remains is the model choosing one unaided.
+
+Possible approaches, none obviously right:
 
 - A post-generation check: for each filtered column that has a value dictionary,
   test whether any *word in the user's question* matches a documented label or
@@ -177,15 +185,7 @@ belongs (`query_executor.py` for the CLI, the `/api/query` payload for the web
 UI) and an obvious escape hatch — a flag or a per-query override — since the
 whole point of a browser is sometimes to look at the data.
 
-### 9. Composite relationships
-
-`Relationship` is single-column (`table.column` → `table.column`). Composite
-foreign keys exist in real schemas and can't be expressed. `PRAGMA
-foreign_key_list` already returns multi-row constraints sharing an `id`, which
-`database.get_foreign_keys()` currently flattens into independent edges — subtly
-wrong for composite keys, though harmless for the common single-column case.
-
-### 10. Web UI metadata editing
+### 9. Web UI metadata editing
 
 The schema panel now shows descriptions and warnings read-only. Editing them in
 the browser and writing back to the YAML would close the loop for non-terminal
@@ -193,15 +193,14 @@ users. Meaningful work: needs a write endpoint, comment-preserving YAML
 round-tripping (a real `ruamel.yaml` dependency — the current hand-rolled writer
 only generates, it can't edit), and conflict handling if the file changed on disk.
 
-### 11. Test coverage for the CLI and web wiring
+### 10. Test coverage for the web wiring
 
-The 41 existing tests cover `metadata.py` and `context.py` thoroughly. The wiring
-— `SQLBrowserSession._load_metadata()`, `BrowserSession.load_file()`, the
-`/api/schema` payload, `--init-metadata` — was verified by hand this session but
-isn't covered. `fastapi.testclient` works against `create_app()` and would cover
-the web side cheaply.
+`metadata.py`, `context.py` and the CLI's metadata wiring are covered. The web
+side — `BrowserSession.load_file()` and the `/api/schema` payload — was verified
+by hand but isn't. `fastapi.testclient` works against `create_app()` and would
+cover it cheaply; `tests/test_cli.py` shows the pattern for stubbing out Ollama.
 
-### 12. `default_time_column` is prompt-only
+### 11. `default_time_column` is prompt-only
 
 It tells the model which column "last month" means, and nothing enforces it. It
 could inform a deterministic check on relative date filters, in the same spirit

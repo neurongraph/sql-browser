@@ -194,10 +194,14 @@ def _render_relationships(metadata: Metadata) -> List[str]:
         detail = []
         if rel.cardinality:
             detail.append(rel.cardinality)
+        if rel.is_composite:
+            # Spelled out because joining a composite key on one column fans out
+            # and silently returns wrong rows - the model has to use all of them.
+            detail.append("composite key: join on ALL of these columns together")
         if rel.note:
             detail.append(_one_line(rel.note))
         suffix = f" ({'; '.join(detail)})" if detail else ""
-        lines.append(f"  - {rel.from_} -> {rel.to}{suffix}")
+        lines.append(f"  - {rel.describe()}{suffix}")
     return lines
 
 

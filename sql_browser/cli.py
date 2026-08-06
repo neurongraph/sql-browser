@@ -66,6 +66,10 @@ class SQLBrowserSession:
         self.executor: Optional[QueryExecutor] = None
         self.conversation_history = []
         self.profile_enabled = profile
+        #: The rendered schema/metadata text sent to the LLM. Held on the session
+        #: rather than passed down the call stack so the `metadata` and `profile`
+        #: commands can rebuild it mid-session.
+        self.schema_info = ""
 
     def start(self) -> None:
         """Start the interactive session."""
@@ -91,17 +95,17 @@ class SQLBrowserSession:
             self._load_metadata()
 
             # Get schema for LLM context
-            schema_info = self.db_inspector.get_schema_description()
+            self.schema_info = self.db_inspector.get_schema_description()
 
             # Show suggestions
             with self.executor.console.status(
                 "[cyan]Waiting for LLM to generate suggestions...[/cyan]", spinner="dots"
             ):
-                suggestions = self.llm.get_query_suggestions(schema_info)
+                suggestions = self.llm.get_query_suggestions(self.schema_info)
             self.executor.display_suggestions(suggestions)
             
             # Main interaction loop
-            self._interaction_loop(schema_info)
+            self._interaction_loop()
             
         except typer.Exit:
             # `typer.Exit` subclasses RuntimeError, so it has to be re-raised
@@ -145,8 +149,14 @@ class SQLBrowserSession:
             f"Profiling complete: {enum_cols} categorical column(s), {range_cols} numeric range column(s)"
         )
 
-    def _load_metadata(self) -> None:
-        """Load the curated metadata layer and report what came of it."""
+    def _load_metadata(self, rebuild_prompt: bool = False) -> None:
+        """Load (or reload) the curated metadata layer and report what came of it.
+
+        Args:
+            rebuild_prompt: Re-render the schema text afterwards. Needed when
+                reloading mid-session, since the loaded metadata only reaches the
+                model through that text.
+        """
         self.db_inspector.metadata, self.db_inspector.metadata_warnings = resolve_metadata(
             self.db_inspector,
             source_path=self.source_path,
@@ -167,11 +177,15 @@ class SQLBrowserSession:
                 f"{len(warnings)} metadata warning(s) - type 'metadata' to see them"
             )
 
-    def _interaction_loop(self, schema_info: str) -> None:
+        if rebuild_prompt:
+            self.schema_info = self.db_inspector.get_schema_description()
+
+    def _interaction_loop(self) -> None:
         """Main interaction loop.
-        
-        Args:
-            schema_info: Database schema description
+
+        Reads `self.schema_info` each turn rather than taking it as a parameter,
+        so the `metadata` command can reload the file from disk and have the very
+        next question use the rebuilt prompt.
         """
         while True:
             try:
@@ -196,7 +210,7 @@ class SQLBrowserSession:
                     ):
                         result = self.llm.translate_to_sql(
                             user_input,
-                            schema_info,
+                            self.schema_info,
                             self.conversation_history
                         )
                     
@@ -212,7 +226,9 @@ class SQLBrowserSession:
 
                     # Deterministic guard: normalize dialect, enforce read-only,
                     # and repair hallucinated tables/columns before executing.
-                    prepared = self._prepare_sql(user_input, schema_info, sql, explanation)
+                    prepared = self._prepare_sql(
+                        user_input, self.schema_info, sql, explanation
+                    )
                     if prepared is None:
                         continue
                     sql, explanation = prepared
@@ -393,10 +409,16 @@ class SQLBrowserSession:
             else:
                 logger.info("Re-profiling database")
                 self._run_profiling(force=True)
+            # New value hints only reach the model through the schema text.
+            self.schema_info = self.db_inspector.get_schema_description()
             self._show_profile()
             return True
 
         elif command == 'metadata':
+            # Reload from disk: the authoring loop is write, ask, refine, so
+            # needing a restart for every edit would be the main friction in it.
+            logger.info("Reloading metadata")
+            self._load_metadata(rebuild_prompt=True)
             self._show_metadata()
             return True
 
@@ -453,7 +475,10 @@ class SQLBrowserSession:
                 console.print("\n[bold cyan]Relationships[/bold cyan]")
                 for rel in metadata.relationships:
                     origin = "declared in the database" if rel.declared else "from metadata"
-                    console.print(f"  {rel.from_} → {rel.to} [dim]({origin})[/dim]")
+                    composite = " [yellow]composite[/yellow]" if rel.is_composite else ""
+                    console.print(
+                        f"  {rel.describe()}{composite} [dim]({origin})[/dim]"
+                    )
 
         warnings = self.db_inspector.metadata_warnings
         if warnings:
@@ -500,7 +525,7 @@ class SQLBrowserSession:
   • schema   - Display the complete database schema
   • tables   - List all tables in the database
   • profile  - Show (or refresh) profiled column values/ranges
-  • metadata - Show the curated metadata layer and any warnings
+  • metadata - Reload the metadata file and show it, with any warnings
   • clear    - Clear conversation history
   • logs     - Show logs directory location
   • help     - Show this help message
@@ -699,6 +724,23 @@ def cli(
     """
     if data_dir:
         settings.data_dir = data_dir
+
+    # Contradictory, and silently ignoring the path you explicitly passed would
+    # be the worst way to resolve it.
+    if metadata and no_metadata:
+        typer.echo(
+            "Error: --metadata and --no-metadata contradict each other. "
+            "Pass one or the other.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if llm_draft and not init_metadata:
+        typer.echo(
+            "Error: --llm-draft only applies with --init-metadata.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     # Write a metadata skeleton and exit, rather than starting a session.
     if init_metadata:
