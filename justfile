@@ -29,6 +29,15 @@ run-sample model=model:
     uv run python examples/create_sample_db.py
     uv run sql-browser --model {{model}} sample.db
 
+# Generate the sample database and open it with the example metadata file
+run-sample-metadata model=model:
+    uv run python examples/create_sample_db.py
+    uv run sql-browser --model {{model}} --metadata examples/sample.meta.yaml sample.db
+
+# Write a starter metadata file next to a database (add llm=1 to draft descriptions)
+init-metadata db model=model llm="":
+    uv run sql-browser --init-metadata {{ if llm != "" { "--llm-draft" } else { "" } }} --model {{model}} {{db}}
+
 # Run the test suite
 test:
     uv run pytest

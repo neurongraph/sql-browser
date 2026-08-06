@@ -180,13 +180,13 @@ async function loadSchema() {
       els.schemaTree.textContent = data.error;
       return;
     }
-    renderSchema(data.tables || []);
+    renderSchema(data.tables || [], data.relationships || [], data.metadata_warnings || []);
   } catch (e) {
     els.schemaTree.textContent = "Failed to load schema.";
   }
 }
 
-function renderSchema(tables) {
+function renderSchema(tables, relationships, metadataWarnings) {
   els.schemaTree.innerHTML = "";
   for (const table of tables) {
     const wrap = document.createElement("div");
@@ -201,6 +201,17 @@ function renderSchema(tables) {
     const cols = document.createElement("ul");
     cols.className = "schema-cols";
     cols.style.display = "none";
+
+    // Curated descriptions, when a metadata file supplied them.
+    if (table.description || table.grain) {
+      const note = document.createElement("li");
+      note.className = "tbl-note";
+      note.textContent = table.grain
+        ? `${table.description || ""} (one row per ${table.grain})`.trim()
+        : table.description;
+      cols.appendChild(note);
+    }
+
     for (const col of table.columns) {
       const li = document.createElement("li");
       const profile = table.profile && table.profile[col.name];
@@ -214,7 +225,10 @@ function renderSchema(tables) {
         escapeHtml(col.name) +
         ` <span class="col-type">${escapeHtml(col.type)}</span>` +
         (col.pk ? ' <span class="pk">PK</span>' : "") +
-        hint;
+        hint +
+        (col.description
+          ? ` <span class="col-desc">${escapeHtml(col.description)}</span>`
+          : "");
       cols.appendChild(li);
     }
 
@@ -224,6 +238,51 @@ function renderSchema(tables) {
 
     wrap.appendChild(name);
     wrap.appendChild(cols);
+    els.schemaTree.appendChild(wrap);
+  }
+
+  renderSchemaExtras(relationships, metadataWarnings);
+}
+
+/**
+ * Append the join graph and any metadata problems below the table list.
+ *
+ * Both are collapsed by default: they matter when a query joins wrongly or a
+ * metadata file has drifted, not on every glance at the schema.
+ */
+function renderSchemaExtras(relationships, metadataWarnings) {
+  const sections = [
+    { title: "Relationships", className: "schema-rels", items: relationships.map((r) => `${r.from} → ${r.to}`) },
+    { title: "Metadata warnings", className: "schema-warnings", items: metadataWarnings },
+  ];
+
+  for (const section of sections) {
+    if (!section.items.length) continue;
+
+    const wrap = document.createElement("div");
+    wrap.className = "schema-table";
+
+    const heading = document.createElement("div");
+    heading.className = "tbl-name";
+    heading.innerHTML =
+      escapeHtml(section.title) +
+      ` <span class="row-count">(${section.items.length})</span>`;
+
+    const list = document.createElement("ul");
+    list.className = `schema-cols ${section.className}`;
+    list.style.display = "none";
+    for (const item of section.items) {
+      const li = document.createElement("li");
+      li.textContent = item;
+      list.appendChild(li);
+    }
+
+    heading.addEventListener("click", () => {
+      list.style.display = list.style.display === "none" ? "block" : "none";
+    });
+
+    wrap.appendChild(heading);
+    wrap.appendChild(list);
     els.schemaTree.appendChild(wrap);
   }
 }
