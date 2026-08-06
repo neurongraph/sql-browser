@@ -4,12 +4,34 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SQL Browser</title>
-  <link rel="stylesheet" href="/static/style.css?v=3" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/style.css?v=4" />
 </head>
 <body>
   <header>
     <h1>SQL Browser</h1>
-    <span id="db-name" class="db-name"></span>
+
+    <div class="toolbar">
+      <label class="field">
+        <span>File</span>
+        <select id="file-select"></select>
+      </label>
+      <button type="button" id="upload-btn" class="secondary">Upload…</button>
+      <input
+        type="file"
+        id="file-input"
+        accept=".db,.sqlite,.sqlite3,.xlsx,.xlsm"
+        hidden
+      />
+
+      <label class="field">
+        <span>Model</span>
+        <select id="model-select"></select>
+      </label>
+
+      <button type="button" id="load-btn">Load</button>
+      <span id="toolbar-status" class="toolbar-status"></span>
+    </div>
   </header>
 
   <div class="layout">
@@ -68,6 +90,6 @@
     </template>
   </div>
 
-  <script src="/static/app.js?v=3"></script>
+  <script src="/static/app.js?v=4"></script>
 </body>
 </html>

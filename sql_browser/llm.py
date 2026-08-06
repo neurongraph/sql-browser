@@ -6,15 +6,46 @@ from typing import Dict, Optional
 
 import ollama
 from json_repair import repair_json
+from .config import DEFAULT_MODEL
 from .logger import get_logger
 
 logger = get_logger(__name__)
 
 
+def list_models() -> list[str]:
+    """Return the names of the models Ollama has available, sorted.
+
+    Used to populate the web UI's model selector. Returns an empty list if
+    Ollama isn't reachable so the UI can render (and say so) instead of
+    failing - the model in use is reported separately.
+    """
+    try:
+        response = ollama.list()
+    except Exception as e:
+        logger.warning(f"Could not list Ollama models: {e}")
+        return []
+
+    # ollama-python returns a ListResponse of Model objects on recent versions
+    # and a plain dict on older ones; support both.
+    entries = getattr(response, "models", None)
+    if entries is None:
+        entries = response.get("models", []) if isinstance(response, dict) else []
+
+    names = []
+    for entry in entries:
+        name = getattr(entry, "model", None)
+        if name is None and isinstance(entry, dict):
+            name = entry.get("model") or entry.get("name")
+        if name:
+            names.append(str(name))
+
+    return sorted(names, key=str.lower)
+
+
 class LLMQueryTranslator:
     """Translates natural language queries to SQL using Ollama."""
 
-    def __init__(self, model: str = "gemma4:31b-cloud"):
+    def __init__(self, model: str = DEFAULT_MODEL):
         """Initialize the LLM translator.
         
         Args:

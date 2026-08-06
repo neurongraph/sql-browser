@@ -49,6 +49,9 @@ uv run sql-browser path/to/your/workbook.xlsx
 # Launch the browser-based web UI instead of the terminal
 uv run sql-browser --web path/to/your/database.db
 
+# The file is optional with --web: upload or pick one in the browser instead
+uv run sql-browser --web
+
 # Pick a different model, port, or skip profiling
 uv run sql-browser --model granite4.1:8b mydata.db
 uv run sql-browser --web --port 8137 mydata.db
@@ -68,6 +71,7 @@ just run mydata.db                 # terminal REPL
 just run-no-profile mydata.db      # skip profiling
 just web mydata.db                 # web UI (default model, port 8000)
 just web mydata.xlsx granite4.1:8b 8137 # web UI with custom model + port
+just web-blank                     # web UI with nothing preselected
 just run-sample                    # build the sample DB and open it
 ```
 
@@ -75,17 +79,43 @@ just run-sample                    # build the sample DB and open it
 
 | Option | Description |
 | --- | --- |
-| `--model`, `-m` | Ollama model to use (default `gemma4:31b-cloud`) |
+| `--model`, `-m` | Ollama model to use (default `gemma4:31b-cloud`, or `SQL_BROWSER_DEFAULT_MODEL`) |
 | `--web` | Launch the browser-based UI instead of the terminal REPL |
 | `--port` | Port for the web UI (default `8000`, only used with `--web`) |
+| `--data-dir` | Where the web UI stores uploaded files (default `data/`) |
 | `--no-profile` | Skip profiling the database (column values/ranges) for text-to-SQL hints |
 | `--version`, `-v` | Show version and exit |
+
+The `database` argument is required for the terminal REPL but optional with
+`--web`, where the file can be chosen in the browser.
+
+## Configuration
+
+Everything has a default, so no configuration is needed. To change one, copy
+`.env.example` to `.env` (git-ignored) and edit it, or export the equivalent
+variable:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `SQL_BROWSER_DATA_DIR` | `data` | Where the web UI stores uploaded files |
+| `SQL_BROWSER_DEFAULT_MODEL` | `gemma4:31b-cloud` | Model used when none is given |
+| `SQL_BROWSER_MAX_UPLOAD_MB` | `256` | Upload size limit |
 
 ## Web UI
 
 Run with `--web` and open the printed URL (default http://127.0.0.1:8000). It is
 localhost-only and single-user. The interface provides:
 
+- **File and model selectors** in the header. Both are pre-selected from the
+  command line when given; otherwise the file selector starts empty and the
+  model selector lists everything `ollama list` reports. Switching the model
+  keeps your transcript and schema; switching the file resets the transcript.
+  **Load** re-opens and re-profiles the current file, for a database that
+  changed on disk.
+- **Upload…** adds a `.db`/`.sqlite`/`.sqlite3`/`.xlsx`/`.xlsm` file to the data
+  directory and loads it immediately. Browsers can't hand a server a real
+  filesystem path, so uploading is how files get into the selector - a file
+  passed on the command line is read in place and never copied.
 - A **schema sidebar** listing tables and columns (with profiled value/range hints).
 - A pinned **natural-language box** and clickable **suggestion chips**.
 - A **scrollable transcript**: each question appends a new entry with its own
@@ -192,8 +222,9 @@ uv run pytest --cov=sql_browser
 sql_browser/
 ├── __init__.py
 ├── cli.py              # CLI entry point with Typer (--web launches the UI)
-├── web.py              # FastAPI backend for the web UI
+├── web.py              # FastAPI backend for the web UI (file/model switching)
 ├── static/             # Web UI frontend (index.html, app.js, style.css)
+├── config.py           # Settings from .env / environment (data dir, model)
 ├── database.py         # Database operations and schema inspection
 ├── excel_loader.py     # Excel workbook -> temporary SQLite conversion
 ├── profiler.py         # Column value/range profiling (cached in the DB)

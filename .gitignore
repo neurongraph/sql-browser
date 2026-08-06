@@ -53,6 +53,16 @@ Thumbs.db
 *.sqlite3
 !tests/fixtures/*.db
 
+# Local configuration
+.env
+
+# Local launcher scripts - these hold API tokens, never commit them
+claude.sh
+*.local.sh
+
+# Web UI uploads (see SQL_BROWSER_DATA_DIR in .env.example)
+data/
+
 # Made with Bob
 
 .agents/

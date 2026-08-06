@@ -7,6 +7,7 @@ from typing import Optional
 import typer
 from rich.prompt import Prompt
 
+from .config import DEFAULT_MODEL, settings
 from .database import DatabaseInspector
 from .excel_loader import EXCEL_EXTENSIONS, ExcelLoadError, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator
@@ -28,7 +29,7 @@ logger = get_logger(__name__)
 class SQLBrowserSession:
     """Manages an interactive SQL Browser session."""
 
-    def __init__(self, db_path: str, model: str = "gemma4:31b-cloud", profile: bool = True):
+    def __init__(self, db_path: str, model: str = DEFAULT_MODEL, profile: bool = True):
         """Initialize the session.
 
         Args:
@@ -85,6 +86,10 @@ class SQLBrowserSession:
             # Main interaction loop
             self._interaction_loop(schema_info)
             
+        except typer.Exit:
+            # `typer.Exit` subclasses RuntimeError, so it has to be re-raised
+            # before the handler below turns a clean `exit` into "Error: 0".
+            raise
         except FileNotFoundError as e:
             logger.error(f"Database file not found: {e}")
             typer.echo(f"Error: {e}", err=True)
@@ -421,20 +426,21 @@ def version_callback(value: bool):
 
 @app.command(name="sql-browser")
 def cli(
-    database: Path = typer.Argument(
-        ...,
+    database: Optional[Path] = typer.Argument(
+        None,
         help="Path to a SQLite database file, or an Excel workbook (.xlsx/.xlsm) "
-        "whose sheets will be loaded as tables",
+        "whose sheets will be loaded as tables. Optional with --web: the file "
+        "can be picked in the browser instead",
         exists=True,
         file_okay=True,
         dir_okay=False,
         readable=True,
     ),
-    model: str = typer.Option(
-        "gemma4:31b-cloud",
+    model: Optional[str] = typer.Option(
+        None,
         "--model",
         "-m",
-        help="Ollama model to use",
+        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
     ),
     no_profile: bool = typer.Option(
         False,
@@ -450,6 +456,14 @@ def cli(
         8000,
         "--port",
         help="Port for the web UI (only used with --web)",
+    ),
+    data_dir: Optional[Path] = typer.Option(
+        None,
+        "--data-dir",
+        help="Directory the web UI stores uploaded files in "
+        f"(default: {settings.data_dir})",
+        file_okay=False,
+        dir_okay=True,
     ),
     version: Optional[bool] = typer.Option(
         None,
@@ -474,22 +488,37 @@ def cli(
       sql-browser --model gemma4:31b-cloud mydata.db
       sql-browser --no-profile mydata.db
       sql-browser --web mydata.db
+      sql-browser --web                    # pick the file in the browser
     """
-    # Launch the web UI instead of the terminal REPL
+    if data_dir:
+        settings.data_dir = data_dir
+
+    # Launch the web UI instead of the terminal REPL. The database is optional
+    # here - it can be uploaded or picked from the data directory in the UI.
     if web:
         from .web import run_web
 
         run_web(
-            str(database),
+            str(database) if database else None,
             model=model,
             profile=not no_profile,
             port=port,
         )
         return
 
+    if database is None:
+        typer.echo(
+            "Error: a database or Excel workbook is required for the terminal REPL.\n"
+            "Pass one as an argument, or use --web to pick a file in the browser.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     # Start session
     try:
-        session = SQLBrowserSession(str(database), model=model, profile=not no_profile)
+        session = SQLBrowserSession(
+            str(database), model=model or DEFAULT_MODEL, profile=not no_profile
+        )
     except ExcelLoadError as e:
         logger.error(f"Failed to load Excel workbook: {e}")
         typer.echo(f"Error: could not load '{database.name}':", err=True)

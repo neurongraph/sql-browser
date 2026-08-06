@@ -2,8 +2,13 @@
 
 A thin HTTP layer over the same core modules the CLI uses: the LLM translator,
 the sqlglot guard/repair layer, the value-mismatch corrector, and the database
-inspector. It is deliberately localhost-only and single-user (no auth, no file
-uploads) - it serves the static frontend and a small JSON API.
+inspector. It is deliberately localhost-only and single-user (no auth).
+
+The database and model are chosen in the UI rather than fixed at startup, so
+the mutable state lives in a `BrowserSession` that can be re-bound at runtime
+(see `/api/session`). A file passed on the command line is loaded in place and
+pre-selected; anything else has to be uploaded into the configured data
+directory first, because a browser can't hand the server a filesystem path.
 
 The value-correction step can't block on a terminal prompt over HTTP, so it is
 split into two phases:
@@ -21,14 +26,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .config import DEFAULT_MODEL, SQLITE_EXTENSIONS, settings
 from .database import DatabaseInspector
 from .excel_loader import EXCEL_EXTENSIONS, convert_xlsx_to_sqlite
-from .llm import LLMQueryTranslator
+from .llm import LLMQueryTranslator, list_models
 from .logger import get_logger
 from .profiler import profile_database
 from .query_corrector import apply_value_choices, find_value_mismatches
@@ -43,6 +49,13 @@ from .sql_guard import (
 logger = get_logger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+#: Everything the file selector and the upload endpoint will accept.
+ALLOWED_EXTENSIONS = SQLITE_EXTENSIONS | EXCEL_EXTENSIONS
+
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+NO_FILE_ERROR = "No file loaded. Upload or pick a file to begin."
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +77,15 @@ class RunSqlRequest(BaseModel):
     choices: List[ValueChoice] = []
 
 
+class SessionRequest(BaseModel):
+    """A file and/or model to bind. Omitted fields are left as they are."""
+
+    file: Optional[str] = None
+    model: Optional[str] = None
+    #: Re-open and re-profile the file even if it's already the loaded one.
+    force: bool = False
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -82,59 +104,140 @@ def _rows_to_json(column_names: List[str], rows: List[Any]) -> List[List[Any]]:
     return safe_rows
 
 
-def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = True) -> FastAPI:
-    """Build the FastAPI app wired to a specific database.
+class BrowserSession:
+    """The database + model the UI is currently pointed at.
 
-    Args:
-        db_path: Path to a SQLite database or an Excel workbook
-        model: Ollama model to use
-        profile: Whether to profile the database at startup for value hints
-
-    Returns:
-        A configured FastAPI application.
+    Everything mutable lives here so `/api/session` can swap the file or the
+    model without restarting the server. All access is serialized with a single
+    re-entrant lock: SQLite connections are opened with
+    ``check_same_thread=False`` because requests are served from a thread pool,
+    and a re-bind must not race a query.
     """
-    source_path = Path(db_path)
-    temp_db_path: Optional[Path] = None
 
-    if source_path.suffix.lower() in EXCEL_EXTENSIONS:
-        logger.info(f"Converting Excel workbook to temporary SQLite database: {source_path}")
-        temp_db_path = convert_xlsx_to_sqlite(source_path)
-        resolved_db_path = str(temp_db_path)
-    else:
-        resolved_db_path = str(source_path)
+    def __init__(self, model: str = DEFAULT_MODEL, profile: bool = True):
+        """Initialize an empty session (no database bound yet).
 
-    inspector = DatabaseInspector(resolved_db_path)
-    # Web requests are served from a thread pool; connect accordingly and
-    # serialize all database access with a lock.
-    inspector.connect(check_same_thread=False)
-    lock = threading.Lock()
+        Args:
+            model: Ollama model to start with
+            profile: Whether to profile a database when it's loaded, for
+                column value/range hints that improve text-to-SQL accuracy
+        """
+        self.lock = threading.RLock()
+        self.profile_enabled = profile
+        # Fails fast if Ollama isn't running - the whole app depends on it.
+        self.llm = LLMQueryTranslator(model=model)
 
-    llm = LLMQueryTranslator(model=model)
+        self.inspector: Optional[DatabaseInspector] = None
+        self.source_path: Optional[Path] = None
+        self.schema_info: str = ""
+        self.conversation_history: List[Dict[str, str]] = []
+        self._temp_db_path: Optional[Path] = None
+        #: A path given on the command line. Trusted, and loadable even though
+        #: it lives outside the data directory.
+        self.pinned_path: Optional[Path] = None
 
-    if profile:
-        try:
-            inspector.profile = profile_database(inspector)
-            logger.info("Startup profiling complete")
-        except Exception as e:
-            logger.warning(f"Startup profiling failed: {e}")
+    # -- state ------------------------------------------------------------- #
 
-    schema_info = inspector.get_schema_description()
-    conversation_history: List[Dict[str, str]] = []
+    @property
+    def ready(self) -> bool:
+        """True once a database is bound and connected."""
+        return self.inspector is not None
 
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI):
-        yield
-        logger.debug("Shutting down web app; closing database")
-        inspector.disconnect()
-        if temp_db_path:
-            temp_db_path.unlink(missing_ok=True)
+    @property
+    def model(self) -> str:
+        return self.llm.model
 
-    app = FastAPI(title="SQL Browser", lifespan=lifespan)
+    @property
+    def file_name(self) -> Optional[str]:
+        """The selector value identifying the loaded file, or None."""
+        return _selector_value(self.source_path) if self.source_path else None
 
-    def _execute(sql: str) -> Dict[str, Any]:
+    # -- (re)binding ------------------------------------------------------- #
+
+    def load_file(self, path: Path) -> None:
+        """Bind a SQLite database or Excel workbook, replacing any current one.
+
+        The new database is opened and profiled *before* the old one is
+        released, so a failed load leaves the previous database usable.
+
+        Args:
+            path: Path to a SQLite database or an .xlsx/.xlsm workbook
+
+        Raises:
+            FileNotFoundError: The path doesn't exist
+            ExcelLoadError: The workbook couldn't be converted
+        """
+        with self.lock:
+            temp_db_path: Optional[Path] = None
+            if path.suffix.lower() in EXCEL_EXTENSIONS:
+                logger.info(f"Converting Excel workbook to temporary SQLite database: {path}")
+                temp_db_path = convert_xlsx_to_sqlite(path)
+                resolved = temp_db_path
+            else:
+                resolved = path
+
+            try:
+                inspector = DatabaseInspector(str(resolved))
+                inspector.connect(check_same_thread=False)
+
+                if self.profile_enabled:
+                    try:
+                        inspector.profile = profile_database(inspector)
+                        logger.info(f"Profiling complete for {path.name}")
+                    except Exception as e:
+                        logger.warning(f"Profiling failed for {path.name}: {e}")
+
+                schema_info = inspector.get_schema_description()
+            except Exception:
+                if temp_db_path:
+                    temp_db_path.unlink(missing_ok=True)
+                raise
+
+            # Only now let go of the previous database.
+            self._release_database()
+
+            self.inspector = inspector
+            self.source_path = path
+            self._temp_db_path = temp_db_path
+            self.schema_info = schema_info
+            # Past turns described a different database; they'd mislead the LLM.
+            self.conversation_history = []
+            logger.info(f"Loaded {path} (model: {self.model})")
+
+    def set_model(self, model: str) -> None:
+        """Point the translator at a different Ollama model.
+
+        Cheap, and independent of the database: the schema and the conversation
+        transcript are left alone.
+        """
+        with self.lock:
+            if model != self.llm.model:
+                logger.info(f"Switching model: {self.llm.model} -> {model}")
+                self.llm.model = model
+
+    def close(self) -> None:
+        """Release the database connection and any temporary file."""
+        with self.lock:
+            self._release_database()
+            self.inspector = None
+            self.source_path = None
+            self.schema_info = ""
+
+    def _release_database(self) -> None:
+        """Disconnect the current inspector and delete its temp database."""
+        if self.inspector:
+            self.inspector.disconnect()
+        if self._temp_db_path:
+            logger.debug(f"Removing temporary database: {self._temp_db_path}")
+            self._temp_db_path.unlink(missing_ok=True)
+            self._temp_db_path = None
+
+    # -- query pipeline ---------------------------------------------------- #
+
+    def execute(self, sql: str) -> Dict[str, Any]:
         """Run a read-only query and return columns + JSON-safe rows."""
-        with lock:
-            column_names, rows = inspector.execute_query(sql)
+        with self.lock:
+            column_names, rows = self.inspector.execute_query(sql)
         return {
             "sql": sql,
             "columns": column_names,
@@ -142,7 +245,7 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
             "row_count": len(rows),
         }
 
-    def _guard_and_repair(user_query: str, sql: str, explanation: str) -> Dict[str, Any]:
+    def guard_and_repair(self, user_query: str, sql: str, explanation: str) -> Dict[str, Any]:
         """Normalize, validate, and (once) repair a generated query.
 
         Returns a dict with either an "error" key or a validated "sql" +
@@ -152,14 +255,18 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
         if not is_read_only(sql):
             return {"error": "Only read-only SELECT queries are allowed."}
 
-        with lock:
-            schema = build_schema(inspector)
+        with self.lock:
+            schema = build_schema(self.inspector)
         problems = find_schema_problems(sql, schema)
         if problems:
             logger.info(f"Schema problems, attempting repair: {problems}")
             try:
-                repaired = llm.repair_sql(
-                    user_query, schema_info, sql, "; ".join(problems), conversation_history
+                repaired = self.llm.repair_sql(
+                    user_query,
+                    self.schema_info,
+                    sql,
+                    "; ".join(problems),
+                    self.conversation_history,
                 )
                 candidate = transpile_to_sqlite(repaired["sql"])
                 if is_read_only(candidate):
@@ -170,15 +277,248 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
 
         return {"sql": sql, "explanation": explanation}
 
+    def remember(self, user_query: str, sql: str, explanation: str) -> None:
+        """Append a turn to the conversation history, keeping it bounded."""
+        self.conversation_history.append({"role": "user", "content": user_query})
+        self.conversation_history.append(
+            {"role": "assistant", "content": f"SQL: {sql}\nExplanation: {explanation}"}
+        )
+        if len(self.conversation_history) > 20:
+            del self.conversation_history[:-20]
+
+
+# --------------------------------------------------------------------------- #
+# File selection
+# --------------------------------------------------------------------------- #
+
+def _selector_value(path: Path) -> str:
+    """The string the UI uses to refer to a file.
+
+    Files inside the data directory are identified by name; a file pinned from
+    the command line keeps its full path so it stays distinguishable.
+    """
+    data_dir = settings.resolved_data_dir()
+    resolved = path.expanduser().resolve()
+    if resolved.parent == data_dir:
+        return resolved.name
+    return str(resolved)
+
+
+def _list_data_files() -> List[str]:
+    """Names of loadable files sitting in the data directory, sorted."""
+    data_dir = settings.resolved_data_dir()
+    names = [
+        entry.name
+        for entry in data_dir.iterdir()
+        if entry.is_file() and entry.suffix.lower() in ALLOWED_EXTENSIONS
+    ]
+    return sorted(names, key=str.lower)
+
+
+def _resolve_selection(value: str, pinned: Optional[Path]) -> Path:
+    """Turn a selector value from the UI into a path that's safe to open.
+
+    Only two things are loadable: a file inside the data directory, and the
+    path that was pinned on the command line. Anything else - in particular a
+    name containing `..` or an absolute path - is rejected, so a request can't
+    reach arbitrary files on disk.
+
+    Raises:
+        ValueError: The value escapes the data directory and isn't the pinned path
+        FileNotFoundError: The resolved path isn't a file
+    """
+    data_dir = settings.resolved_data_dir()
+    candidate = Path(value).expanduser()
+
+    if pinned and candidate.resolve() == pinned.expanduser().resolve():
+        resolved = pinned.expanduser().resolve()
+    else:
+        resolved = (data_dir / candidate.name).resolve()
+        if resolved.parent != data_dir or candidate.name != value:
+            raise ValueError(
+                f"'{value}' is not in the data directory. "
+                "Upload it, or pass it on the command line."
+            )
+
+    if resolved.suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise ValueError(f"Unsupported file type: '{resolved.suffix}'")
+    if not resolved.is_file():
+        raise FileNotFoundError(f"File not found: {value}")
+    return resolved
+
+
+def _unique_upload_path(data_dir: Path, filename: str) -> Path:
+    """Pick a non-clobbering destination for an upload.
+
+    `report.xlsx` becomes `report-1.xlsx` when the name is already taken.
+    """
+    base = Path(filename).stem
+    suffix = Path(filename).suffix
+    destination = data_dir / f"{base}{suffix}"
+    counter = 1
+    while destination.exists():
+        destination = data_dir / f"{base}-{counter}{suffix}"
+        counter += 1
+    return destination
+
+
+# --------------------------------------------------------------------------- #
+# Application
+# --------------------------------------------------------------------------- #
+
+def create_app(
+    db_path: Optional[str] = None,
+    model: Optional[str] = None,
+    profile: bool = True,
+) -> FastAPI:
+    """Build the FastAPI app.
+
+    Args:
+        db_path: Optional path to a SQLite database or Excel workbook to load
+            at startup and pre-select in the UI. Read in place, never copied.
+        model: Ollama model to start with (defaults to the configured one)
+        profile: Whether to profile a database when it's loaded, for value hints
+
+    Returns:
+        A configured FastAPI application.
+    """
+    session = BrowserSession(model=model or DEFAULT_MODEL, profile=profile)
+
+    if db_path:
+        source = Path(db_path).expanduser().resolve()
+        session.pinned_path = source
+        session.load_file(source)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        logger.debug("Shutting down web app; closing database")
+        session.close()
+
+    app = FastAPI(title="SQL Browser", lifespan=lifespan)
+
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> FileResponse:
+        # index.html points at the SVG directly; this covers browsers that
+        # probe the well-known path anyway, so it doesn't log a 404.
+        return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+
+    # -- session / selectors ------------------------------------------------ #
+
+    def _config_payload() -> Dict[str, Any]:
+        files: List[Dict[str, str]] = [
+            {"value": name, "label": name} for name in _list_data_files()
+        ]
+        # A file pinned on the command line lives outside the data directory,
+        # so add it explicitly to keep it selectable. Its value is the full
+        # path (to stay unambiguous) but it's labelled by name.
+        if session.pinned_path:
+            pinned = _selector_value(session.pinned_path)
+            if all(entry["value"] != pinned for entry in files):
+                files.insert(
+                    0,
+                    {
+                        "value": pinned,
+                        "label": f"{session.pinned_path.name}  (command line)",
+                    },
+                )
+
+        models = list_models()
+        if session.model not in models:
+            models.insert(0, session.model)
+
+        return {
+            "file": session.file_name,
+            "database": session.source_path.name if session.source_path else None,
+            "model": session.model,
+            "files": files,
+            "models": models,
+            "ready": session.ready,
+            "data_dir": str(settings.resolved_data_dir()),
+            "max_upload_mb": settings.max_upload_mb,
+        }
+
+    @app.get("/api/config")
+    def get_config() -> Dict[str, Any]:
+        return _config_payload()
+
+    @app.post("/api/session")
+    def set_session(request: SessionRequest) -> Dict[str, Any]:
+        """Bind a file and/or a model, then report the new configuration."""
+        if request.model:
+            session.set_model(request.model)
+
+        file_changed = False
+        if request.file and (request.force or request.file != session.file_name):
+            try:
+                path = _resolve_selection(request.file, session.pinned_path)
+                session.load_file(path)
+                file_changed = True
+            except (ValueError, FileNotFoundError) as e:
+                logger.warning(f"Rejected file selection '{request.file}': {e}")
+                return {"error": str(e), **_config_payload()}
+            except Exception as e:
+                logger.exception(f"Failed to load '{request.file}'")
+                issues = getattr(e, "issues", None)
+                detail = "; ".join(issues) if issues else str(e)
+                return {"error": f"Could not load '{request.file}': {detail}",
+                        **_config_payload()}
+
+        return {"ok": True, "file_changed": file_changed, **_config_payload()}
+
+    @app.post("/api/upload")
+    async def upload(file: UploadFile = File(...)) -> Dict[str, Any]:
+        """Store an uploaded database/workbook in the data directory.
+
+        Only the base name of the client-supplied filename is used, so a
+        crafted name can't write outside the data directory.
+        """
+        name = Path(file.filename or "").name
+        if not name:
+            return {"error": "No filename provided."}
+        if Path(name).suffix.lower() not in ALLOWED_EXTENSIONS:
+            allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+            return {"error": f"Unsupported file type. Allowed: {allowed}"}
+
+        data_dir = settings.resolved_data_dir()
+        destination = _unique_upload_path(data_dir, name)
+        limit = settings.max_upload_mb * 1024 * 1024
+        written = 0
+
+        try:
+            with destination.open("wb") as out:
+                while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                    written += len(chunk)
+                    if written > limit:
+                        raise ValueError(
+                            f"File is larger than the {settings.max_upload_mb} MB limit."
+                        )
+                    out.write(chunk)
+        except Exception as e:
+            destination.unlink(missing_ok=True)
+            logger.warning(f"Upload of '{name}' failed: {e}")
+            return {"error": str(e)}
+        finally:
+            await file.close()
+
+        logger.info(f"Uploaded {destination} ({written} bytes)")
+        # `uploaded` is the (possibly de-duplicated) stored name for the UI to
+        # select; the rest is the refreshed selector state.
+        return {"uploaded": destination.name, **_config_payload()}
+
+    # -- data --------------------------------------------------------------- #
+
     @app.get("/api/schema")
     def get_schema() -> Dict[str, Any]:
-        with lock:
-            full_schema = inspector.get_full_schema()
-            profile_data = inspector.profile
+        if not session.ready:
+            return {"error": NO_FILE_ERROR}
+        with session.lock:
+            full_schema = session.inspector.get_full_schema()
+            profile_data = session.inspector.profile
         tables = []
         for name, info in full_schema.items():
             tables.append({
@@ -190,12 +530,14 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
                 ],
                 "profile": profile_data.get(name, {}),
             })
-        return {"database": source_path.name, "tables": tables}
+        return {"database": session.source_path.name, "tables": tables}
 
     @app.get("/api/suggestions")
     def get_suggestions() -> Dict[str, Any]:
+        if not session.ready:
+            return {"suggestions": []}
         try:
-            suggestions = llm.get_query_suggestions(schema_info)
+            suggestions = session.llm.get_query_suggestions(session.schema_info)
         except Exception as e:
             logger.warning(f"Suggestions failed: {e}")
             suggestions = []
@@ -203,18 +545,23 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
 
     @app.post("/api/query")
     def run_query(request: QueryRequest) -> Dict[str, Any]:
+        if not session.ready:
+            return {"error": NO_FILE_ERROR}
+
         query = request.query.strip()
         if not query:
             return {"error": "Empty query."}
 
         logger.info(f"Web query: {query}")
         try:
-            result = llm.translate_to_sql(query, schema_info, conversation_history)
+            result = session.llm.translate_to_sql(
+                query, session.schema_info, session.conversation_history
+            )
         except Exception as e:
             logger.error(f"Translation failed: {e}")
             return {"error": f"Translation error: {e}"}
 
-        guarded = _guard_and_repair(query, result["sql"], result["explanation"])
+        guarded = session.guard_and_repair(query, result["sql"], result["explanation"])
         if "error" in guarded:
             return {"sql": result["sql"], **guarded}
 
@@ -223,8 +570,8 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
         confidence = result.get("confidence", "medium")
 
         # Auto-fix obvious value typos; surface ambiguous ones to the picker.
-        with lock:
-            fixed_sql, mismatches = find_value_mismatches(sql, inspector)
+        with session.lock:
+            fixed_sql, mismatches = find_value_mismatches(sql, session.inspector)
 
         response: Dict[str, Any] = {
             "sql": fixed_sql,
@@ -237,13 +584,13 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
         if not mismatches:
             final_sql = enforce_limit(fixed_sql)
             try:
-                execution = _execute(final_sql)
+                execution = session.execute(final_sql)
             except Exception as e:
                 logger.warning(f"Query execution failed: {e}")
                 response["result"] = {"error": str(e)}
                 return response
             response["result"] = execution
-            _remember(query, final_sql, explanation)
+            session.remember(query, final_sql, explanation)
         else:
             response["result"] = None
 
@@ -251,6 +598,9 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
 
     @app.post("/api/run-sql")
     def run_sql(request: RunSqlRequest) -> Dict[str, Any]:
+        if not session.ready:
+            return {"error": NO_FILE_ERROR}
+
         choices = [c.model_dump() for c in request.choices]
         sql = apply_value_choices(request.sql, choices)
         sql = transpile_to_sqlite(sql)
@@ -260,18 +610,10 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
 
         sql = enforce_limit(sql)
         try:
-            return _execute(sql)
+            return session.execute(sql)
         except Exception as e:
             logger.warning(f"run-sql execution failed: {e}")
             return {"error": str(e), "sql": sql}
-
-    def _remember(user_query: str, sql: str, explanation: str) -> None:
-        conversation_history.append({"role": "user", "content": user_query})
-        conversation_history.append(
-            {"role": "assistant", "content": f"SQL: {sql}\nExplanation: {explanation}"}
-        )
-        if len(conversation_history) > 20:
-            del conversation_history[:-20]
 
     # Serve the frontend assets (index.html is served explicitly at "/").
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -280,8 +622,8 @@ def create_app(db_path: str, model: str = "gemma4:31b-cloud", profile: bool = Tr
 
 
 def run_web(
-    db_path: str,
-    model: str = "gemma4:31b-cloud",
+    db_path: Optional[str] = None,
+    model: Optional[str] = None,
     profile: bool = True,
     host: str = "127.0.0.1",
     port: int = 8000,

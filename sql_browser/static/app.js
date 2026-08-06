@@ -3,7 +3,6 @@
 const $ = (id) => document.getElementById(id);
 
 const els = {
-  dbName: $("db-name"),
   schemaTree: $("schema-tree"),
   askForm: $("ask-form"),
   nlInput: $("nl-input"),
@@ -11,7 +10,17 @@ const els = {
   suggestions: $("suggestions"),
   history: $("history"),
   turnTemplate: $("turn-template"),
+  fileSelect: $("file-select"),
+  fileInput: $("file-input"),
+  uploadBtn: $("upload-btn"),
+  modelSelect: $("model-select"),
+  loadBtn: $("load-btn"),
+  toolbarStatus: $("toolbar-status"),
 };
+
+// Mirrors the server's bound file/model so we can tell a real change from a
+// no-op and avoid reloading the schema when only the model was switched.
+const state = { file: null, model: null, ready: false, maxUploadMb: 0 };
 
 async function postJSON(url, body) {
   const res = await fetch(url, {
@@ -32,13 +41,145 @@ function escapeHtml(value) {
 }
 
 // --------------------------------------------------------------------------- //
+// Toolbar: file + model selectors
+// --------------------------------------------------------------------------- //
+
+function setToolbarStatus(message, isError = false, spinner = false) {
+  els.toolbarStatus.className = "toolbar-status" + (isError ? " error" : "");
+  els.toolbarStatus.innerHTML =
+    (spinner ? '<span class="spinner"></span>' : "") + escapeHtml(message || "");
+}
+
+/** Populate a <select> from plain strings or {value, label} entries. */
+function fillSelect(select, entries, selected, placeholder) {
+  select.innerHTML = "";
+  if (placeholder) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = placeholder;
+    select.appendChild(option);
+  }
+  for (const entry of entries) {
+    const option = document.createElement("option");
+    option.value = typeof entry === "string" ? entry : entry.value;
+    option.textContent = typeof entry === "string" ? entry : entry.label;
+    select.appendChild(option);
+  }
+  select.value = selected || "";
+}
+
+/** Reflect "is a database loaded?" in the ask form. */
+function setReady(ready) {
+  state.ready = ready;
+  els.nlInput.disabled = !ready;
+  els.askBtn.disabled = !ready;
+  els.nlInput.placeholder = ready
+    ? "Ask a question about your data…"
+    : "Upload or pick a file to begin…";
+}
+
+/** Fetch the server's current file/model plus the available options. */
+async function loadConfig() {
+  let data;
+  try {
+    data = await (await fetch("/api/config")).json();
+  } catch (e) {
+    setToolbarStatus("Could not reach the server.", true);
+    return;
+  }
+  applyConfig(data);
+  if (state.ready) {
+    loadSchema();
+    loadSuggestions();
+  } else {
+    els.schemaTree.textContent = "No file loaded.";
+  }
+}
+
+function applyConfig(data) {
+  state.file = data.file || null;
+  state.model = data.model || null;
+  state.maxUploadMb = data.max_upload_mb || 0;
+  fillSelect(els.fileSelect, data.files || [], data.file, "— no file —");
+  fillSelect(els.modelSelect, data.models || [], data.model);
+  setReady(Boolean(data.ready));
+}
+
+/** Bind the selected file and/or model on the server.
+ *
+ * `force` re-opens and re-profiles the file even when it hasn't changed - what
+ * the Load button does, so a database edited on disk can be picked up.
+ */
+async function loadSession(force = false) {
+  const file = els.fileSelect.value;
+  const model = els.modelSelect.value;
+  if (!force && !file && model === state.model) return;
+
+  const fileChanging = force ? Boolean(file) : file && file !== state.file;
+  els.loadBtn.disabled = true;
+  setToolbarStatus(fileChanging ? "Loading & profiling…" : "Switching model…", false, true);
+
+  try {
+    const data = await postJSON("/api/session", { file: file || null, model, force });
+    applyConfig(data);
+    if (data.error) {
+      setToolbarStatus(data.error, true);
+      return;
+    }
+    setToolbarStatus("");
+
+    if (data.file_changed) {
+      // A different database makes past turns and suggestions misleading.
+      els.history.innerHTML = "";
+      els.suggestions.innerHTML = "";
+      els.schemaTree.textContent = "Loading…";
+      await loadSchema();
+      loadSuggestions();
+    }
+  } catch (e) {
+    setToolbarStatus("Request failed: " + e.message, true);
+  } finally {
+    els.loadBtn.disabled = false;
+  }
+}
+
+/** Upload a file into the server's data directory, then load it. */
+async function uploadFile(file) {
+  const body = new FormData();
+  body.append("file", file);
+
+  els.uploadBtn.disabled = true;
+  setToolbarStatus(`Uploading ${file.name}…`, false, true);
+
+  try {
+    const res = await fetch("/api/upload", { method: "POST", body });
+    const data = await res.json();
+    if (data.error) {
+      setToolbarStatus(data.error, true);
+      return;
+    }
+    // Stored under a possibly de-duplicated name; select that and load it.
+    fillSelect(els.fileSelect, data.files || [], data.uploaded, "— no file —");
+    await loadSession();
+  } catch (e) {
+    setToolbarStatus("Upload failed: " + e.message, true);
+  } finally {
+    els.uploadBtn.disabled = false;
+    els.fileInput.value = "";
+  }
+}
+
+// --------------------------------------------------------------------------- //
 // Schema sidebar
 // --------------------------------------------------------------------------- //
 
 async function loadSchema() {
   try {
     const data = await (await fetch("/api/schema")).json();
-    els.dbName.textContent = data.database || "";
+    if (data.error) {
+      els.schemaTree.textContent = data.error;
+      return;
+    }
     renderSchema(data.tables || []);
   } catch (e) {
     els.schemaTree.textContent = "Failed to load schema.";
@@ -317,5 +458,15 @@ els.askForm.addEventListener("submit", (e) => {
   askQuery();
 });
 
-loadSchema();
-loadSuggestions();
+els.loadBtn.addEventListener("click", () => loadSession(true));
+els.fileSelect.addEventListener("change", () => loadSession());
+els.modelSelect.addEventListener("change", () => loadSession());
+
+els.uploadBtn.addEventListener("click", () => els.fileInput.click());
+els.fileInput.addEventListener("change", () => {
+  const file = els.fileInput.files && els.fileInput.files[0];
+  if (file) uploadFile(file);
+});
+
+setReady(false);
+loadConfig();

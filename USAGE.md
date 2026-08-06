@@ -26,6 +26,9 @@
 
    # Or launch the browser-based web UI
    uv run sql-browser --web sample.db
+
+   # The file is optional with --web - pick or upload one in the browser
+   uv run sql-browser --web
    ```
 
 ## Interfaces
@@ -34,10 +37,12 @@ SQL Browser has two front-ends over the same core engine:
 
 - **Terminal REPL** (default) - type questions at the `🔍` prompt, get
   Rich-formatted tables, use special commands like `schema` and `profile`.
-- **Web UI** (`--web`) - a localhost browser app with a schema sidebar,
-  suggestion chips, an **editable** SQL box, a results table, and a value picker
-  for correcting guessed filter values. Open the printed URL (default
-  http://127.0.0.1:8000); change it with `--port`.
+  Requires a database or workbook argument.
+- **Web UI** (`--web`) - a localhost browser app with file and model selectors, a
+  schema sidebar, suggestion chips, an **editable** SQL box, a results table, and
+  a value picker for correcting guessed filter values. Open the printed URL
+  (default http://127.0.0.1:8000); change it with `--port`. The file argument is
+  optional here.
 
 Both accept a SQLite database **or** an Excel workbook (`.xlsx`/`.xlsm`), where
 each sheet is loaded as a table into a temporary SQLite database for the session:
@@ -53,7 +58,36 @@ With `just`:
 just run mydata.db                 # terminal REPL
 just web mydata.db                 # web UI (default model, port 8000)
 just web mydata.xlsx granite4.1:8b 8137 # web UI with custom model + port
+just web-blank                     # web UI with nothing preselected
 ```
+
+## Choosing the file and model in the web UI
+
+The web UI's header has a **File** selector, an **Upload…** button, a **Model**
+selector, and **Load**. Anything passed on the command line is pre-selected;
+otherwise the file selector starts empty and the model selector lists whatever
+`ollama list` reports.
+
+- **Upload…** copies a `.db`/`.sqlite`/`.sqlite3`/`.xlsx`/`.xlsm` file into the
+  data directory (`data/` by default) and loads it right away. This is how files
+  get into the selector: a browser can't hand a server a real filesystem path.
+- A file passed on the command line is read **in place** - never copied - and
+  appears in the selector labelled `(command line)`.
+- Switching the **model** is cheap: your transcript, schema, and profile stay put.
+- Switching the **file** re-profiles it and clears the transcript, since past
+  questions and their SQL refer to a different database.
+- **Load** re-opens and re-profiles the current file, which is what you want when
+  the database changed on disk.
+- If a file fails to load (corrupt, or a workbook whose layout can't be
+  converted), the error is shown and the previously loaded database stays usable.
+
+Configuration lives in `.env` (copy `.env.example`); every key is optional:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `SQL_BROWSER_DATA_DIR` | `data` | Where uploads are stored (also `--data-dir`) |
+| `SQL_BROWSER_DEFAULT_MODEL` | `gemma4:31b-cloud` | Model used when none is given |
+| `SQL_BROWSER_MAX_UPLOAD_MB` | `256` | Upload size limit |
 
 ## Example Queries
 
@@ -138,11 +172,17 @@ You can specify a different Ollama model:
 uv run sql-browser --model granite4.1:8b sample.db
 ```
 
+In the web UI you can switch models from the header's **Model** selector at any
+time without restarting - it lists whatever `ollama list` reports, and switching
+keeps your transcript and schema.
+
 Available models (must be pulled first with `ollama pull <model>`):
 - `gemma4:31b-cloud` (default, recommended)
 - `gemma4:e4b`
 - `granite4.1:8b`
 - `phi4`
+
+The default can be changed for good with `SQL_BROWSER_DEFAULT_MODEL` in `.env`.
 
 ## Troubleshooting
 
@@ -225,8 +265,12 @@ with db:
 
 ### Embedding the web app
 
-`sql_browser.web.create_app(db_path, model=..., profile=...)` returns a FastAPI
-app you can serve yourself, and `run_web(db_path, ...)` starts uvicorn for you.
+`sql_browser.web.create_app(db_path=None, model=None, profile=True)` returns a
+FastAPI app you can serve yourself, and `run_web(db_path=None, ...)` starts
+uvicorn for you. Both arguments are optional: with no `db_path` the app starts
+unbound and the file is chosen over the API (`POST /api/session`,
+`POST /api/upload`) or in the UI. The mutable file/model state lives in a
+`BrowserSession`, so re-binding doesn't require restarting the server.
 
 ## Examples with Sample Database
 

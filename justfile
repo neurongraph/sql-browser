@@ -20,6 +20,10 @@ run-no-profile db model=model:
 web db model=model port="8000":
     uv run sql-browser --web --port {{port}} --model "{{model}}" "{{db}}"
 
+# Launch the browser-based UI with no file or model preselected
+web-blank port="8000":
+    uv run sql-browser --web --port {{port}}
+
 # Generate the sample database and run sql-browser against it
 run-sample model=model:
     uv run python examples/create_sample_db.py
