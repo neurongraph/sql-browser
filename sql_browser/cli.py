@@ -2,12 +2,13 @@
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import typer
 from rich.prompt import Prompt
 
 from .config import DEFAULT_MODEL, settings
+from .context import select_examples
 from .database import DatabaseInspector
 from .excel_loader import EXCEL_EXTENSIONS, ExcelLoadError, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator
@@ -180,6 +181,24 @@ class SQLBrowserSession:
         if rebuild_prompt:
             self.schema_info = self.db_inspector.get_schema_description()
 
+    def _query_context(self, user_input: str) -> Tuple[str, List[Dict[str, str]]]:
+        """Build the per-question schema text and curated examples for one turn.
+
+        Computed fresh each turn rather than reusing `self.schema_info`,
+        because relevance (context.py) depends on what's actually being
+        asked - `self.schema_info` stays unpruned for the `schema` command and
+        the startup suggestions, which have no question to prune against.
+
+        Returns:
+            (schema text pruned to this question, examples that best match it)
+        """
+        schema_info = self.db_inspector.get_schema_description(question=user_input)
+        examples = select_examples(
+            user_input,
+            self.db_inspector.metadata.examples if self.db_inspector.metadata else [],
+        )
+        return schema_info, examples
+
     def _interaction_loop(self) -> None:
         """Main interaction loop.
 
@@ -205,15 +224,18 @@ class SQLBrowserSession:
                 logger.debug("Translating natural language to SQL...")
 
                 try:
+                    query_schema_info, query_examples = self._query_context(user_input)
+
                     with self.executor.console.status(
                         "[cyan]Thinking... (waiting for LLM)[/cyan]", spinner="dots"
                     ):
                         result = self.llm.translate_to_sql(
                             user_input,
-                            self.schema_info,
-                            self.conversation_history
+                            query_schema_info,
+                            self.conversation_history,
+                            examples=query_examples,
                         )
-                    
+
                     sql = result['sql']
                     explanation = result['explanation']
                     confidence = result.get('confidence', 'medium')
@@ -227,7 +249,7 @@ class SQLBrowserSession:
                     # Deterministic guard: normalize dialect, enforce read-only,
                     # and repair hallucinated tables/columns before executing.
                     prepared = self._prepare_sql(
-                        user_input, self.schema_info, sql, explanation
+                        user_input, query_schema_info, sql, explanation
                     )
                     if prepared is None:
                         continue

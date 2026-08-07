@@ -303,7 +303,7 @@ class DatabaseInspector:
         
         return column_names, rows
 
-    def get_schema_description(self) -> str:
+    def get_schema_description(self, question: Optional[str] = None) -> str:
         """Get a human-readable description of the database schema.
 
         Composing this needs the profile, the declared foreign keys and any
@@ -311,11 +311,17 @@ class DatabaseInspector:
         context.py; this stays as the entry point callers already use. Imported
         lazily because that module needs this class in turn.
 
+        Args:
+            question: The user's natural-language question, if there is one.
+                Passed through to `render_schema_context` to prune full detail
+                to the tables it scores as relevant. None renders every table
+                in full - see that function's docstring.
+
         Returns:
             Formatted string describing the database structure
         """
         from .context import render_schema_context
 
-        return render_schema_context(self)
+        return render_schema_context(self, question=question)
 
 # Made with Bob

@@ -6,6 +6,7 @@ reconciliation leaves no trace, which is the visible half of the additive-only
 guarantee.
 """
 
+from sql_browser import context
 from sql_browser import metadata as md
 from sql_browser.context import render_schema_context
 
@@ -181,5 +182,132 @@ def test_unprofiled_database_renders_plain_columns(db_path):
 
     assert "  - status: TEXT" in text
     assert "(values:" not in text
+
+
+# --------------------------------------------------------------------------- #
+# Relevance-based pruning (BACKLOG.md #1)
+# --------------------------------------------------------------------------- #
+
+#: The brief renderer's column line ("  Columns: a, b, c") vs. the full
+#: renderer's heading ("Columns:" alone, followed by one line per column) -
+#: this substring only ever appears in the brief form.
+BRIEF_COLUMNS_MARKER = "  Columns: "
+
+
+def test_no_question_renders_every_table_in_full(inspector):
+    """The `question=None` default must be identical to the old behaviour."""
+    no_question_result = render_schema_context(inspector)
+    explicit_none_result = render_schema_context(inspector, question=None)
+
+    assert no_question_result == explicit_none_result
+    assert "  - status: TEXT" in no_question_result
+    assert BRIEF_COLUMNS_MARKER not in no_question_result
+
+
+def test_relevant_tables_expands_one_hop_and_prunes_the_rest(composite_inspector):
+    """A table two hops from anything matched is pruned; one hop away is kept."""
+    composite_inspector.metadata, _ = md.reconcile(md.Metadata(), composite_inspector)
+
+    text = render_schema_context(composite_inspector, question="how many staff are there")
+
+    # staff: directly matched, full detail.
+    assert "Table: staff (0 rows)" in text
+    assert "  - office_id: INTEGER" in text
+    # offices: one hop from staff (staff.office_id -> offices.id), full detail.
+    assert "  - country: TEXT\n" in text
+    assert "  - region_code: TEXT" in text
+    # regions: two hops away (offices -> regions), pruned to a brief line -
+    # its full per-column rendering (with the PRIMARY KEY marker) must be gone.
+    assert "Columns: country, code, name" in text
+    assert "  - country: TEXT [PRIMARY KEY]" not in text
+    # depots and nokey/orphans are unrelated to staff entirely - also pruned.
+    assert "Columns: id, c, rc" in text
+    assert "Columns: a, b" in text
+
+
+def test_relevant_tables_falls_back_to_everything_when_nothing_matches(composite_inspector):
+    """Scoring that can't narrow anything down must not hide tables."""
+    composite_inspector.metadata, _ = md.reconcile(md.Metadata(), composite_inspector)
+
+    text = render_schema_context(composite_inspector, question="xyzzy plugh quux")
+
+    # Every table renders in full, exactly as with no question at all.
+    assert "  - country: TEXT [PRIMARY KEY]" in text
+    assert BRIEF_COLUMNS_MARKER not in text
+
+
+def test_relevant_tables_matches_via_value_synonym(inspector):
+    """A question naming a value pulls in the table that value lives on."""
+    attach(
+        inspector,
+        {
+            "tables": {
+                "orders": {
+                    "columns": {
+                        "status": {
+                            "values": {"S": {"label": "Shipped", "synonyms": ["in transit"]}}
+                        }
+                    }
+                }
+            }
+        },
+    )
+
+    relevant = context.relevant_tables(
+        "which orders are in transit", inspector.get_full_schema(), inspector.metadata
+    )
+
+    # "in transit" only matches via the status value's synonym, on orders.
+    # customers is pulled in too, one hop away via the declared foreign key.
+    assert relevant == {"orders", "customers"}
+
+
+def test_relevant_tables_singular_plural_matches_table_name(inspector):
+    attach(inspector, {})
+
+    relevant = context.relevant_tables(
+        "how many customer records exist",
+        inspector.get_full_schema(),
+        inspector.metadata,
+    )
+
+    assert "customers" in relevant
+
+
+# --------------------------------------------------------------------------- #
+# Example selection (BACKLOG.md #2)
+# --------------------------------------------------------------------------- #
+
+def test_select_examples_ranks_by_token_overlap():
+    examples = [
+        md.ExampleQuery(question="total revenue by customer", sql="SELECT 2"),
+        md.ExampleQuery(question="how many orders shipped last month", sql="SELECT 1"),
+    ]
+
+    selected = context.select_examples("how many orders were shipped", examples)
+
+    assert selected
+    assert selected[0]["sql"] == "SELECT 1"
+
+
+def test_select_examples_returns_nothing_when_no_overlap():
+    examples = [md.ExampleQuery(question="total revenue by customer", sql="SELECT 2")]
+
+    assert context.select_examples("what is the weather today", examples) == []
+
+
+def test_select_examples_respects_the_limit():
+    examples = [
+        md.ExampleQuery(question=f"orders question {i}", sql=f"SELECT {i}")
+        for i in range(5)
+    ]
+
+    selected = context.select_examples("orders", examples, limit=2)
+
+    assert len(selected) == 2
+
+
+def test_select_examples_with_no_examples_is_a_noop():
+    assert context.select_examples("how many orders", []) == []
 
 # Made with Bob

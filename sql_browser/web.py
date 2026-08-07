@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .config import DEFAULT_MODEL, SQLITE_EXTENSIONS, settings
+from .context import select_examples
 from .database import DatabaseInspector
 from .excel_loader import EXCEL_EXTENSIONS, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator, list_models
@@ -269,8 +270,19 @@ class BrowserSession:
             "row_count": len(rows),
         }
 
-    def guard_and_repair(self, user_query: str, sql: str, explanation: str) -> Dict[str, Any]:
+    def guard_and_repair(
+        self, user_query: str, sql: str, explanation: str, schema_info: str
+    ) -> Dict[str, Any]:
         """Normalize, validate, and (once) repair a generated query.
+
+        Args:
+            user_query: The user's original question, for the repair prompt
+            sql: The LLM-generated SQL to validate
+            explanation: The LLM's explanation, kept unless repair replaces it
+            schema_info: The (possibly pruned) schema text this query was
+                generated against - the repair prompt reuses it rather than
+                the session's unpruned text, so the model sees the same
+                tables it originally reasoned about
 
         Returns a dict with either an "error" key or a validated "sql" +
         "explanation".
@@ -287,7 +299,7 @@ class BrowserSession:
             try:
                 repaired = self.llm.repair_sql(
                     user_query,
-                    self.schema_info,
+                    schema_info,
                     sql,
                     "; ".join(problems),
                     self.conversation_history,
@@ -615,15 +627,30 @@ def create_app(
             return {"error": "Empty query."}
 
         logger.info(f"Web query: {query}")
+
+        # Pruned to the tables this question scores as relevant, with the
+        # curated examples that best match it - both computed per question,
+        # not at load time. session.schema_info (unpruned) is left for
+        # /api/schema and /api/suggestions, which have no question to prune
+        # against.
+        with session.lock:
+            query_schema_info = session.inspector.get_schema_description(question=query)
+            query_examples = select_examples(
+                query,
+                session.inspector.metadata.examples if session.inspector.metadata else [],
+            )
+
         try:
             result = session.llm.translate_to_sql(
-                query, session.schema_info, session.conversation_history
+                query, query_schema_info, session.conversation_history, examples=query_examples
             )
         except Exception as e:
             logger.error(f"Translation failed: {e}")
             return {"error": f"Translation error: {e}"}
 
-        guarded = session.guard_and_repair(query, result["sql"], result["explanation"])
+        guarded = session.guard_and_repair(
+            query, result["sql"], result["explanation"], query_schema_info
+        )
         if "error" in guarded:
             return {"sql": result["sql"], **guarded}
 

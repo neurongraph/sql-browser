@@ -195,6 +195,40 @@ def test_reconcile_drops_relationship_with_unknown_endpoint(inspector):
     assert any("ghosts.id" in w for w in warnings)
 
 
+# --------------------------------------------------------------------------- #
+# Examples (few-shot pairs)
+# --------------------------------------------------------------------------- #
+
+def test_reconcile_keeps_an_example_that_matches_the_schema(inspector):
+    metadata = md.Metadata.model_validate(
+        {"examples": [{"question": "how many orders", "sql": "SELECT COUNT(*) FROM orders"}]}
+    )
+
+    reconciled, warnings = md.reconcile(metadata, inspector)
+
+    assert len(reconciled.examples) == 1
+    assert reconciled.examples[0].question == "how many orders"
+    assert warnings == []
+
+
+def test_reconcile_drops_an_example_referencing_an_unknown_column(inspector):
+    metadata = md.Metadata.model_validate(
+        {"examples": [{"question": "bad column", "sql": "SELECT nonexistent FROM orders"}]}
+    )
+
+    reconciled, warnings = md.reconcile(metadata, inspector)
+
+    assert reconciled.examples == []
+    assert any("bad column" in w for w in warnings)
+
+
+def test_no_examples_is_not_an_error(inspector):
+    reconciled, warnings = md.reconcile(md.Metadata(), inspector)
+
+    assert reconciled.examples == []
+    assert warnings == []
+
+
 def test_reconcile_adds_declared_foreign_keys(inspector):
     """A database with real constraints gets a join graph with no file at all."""
     reconciled, warnings = md.reconcile(md.Metadata(), inspector)

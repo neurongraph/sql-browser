@@ -10,81 +10,31 @@ single-column join on them is never presented as valid), curated YAML sidecar
 conventions, rules), additive-only reconciliation, label→code resolution in the
 query corrector, mid-session metadata reload, and `--init-metadata` scaffolding.
 
+Phase 2 delivered: relevance-based prompt pruning (`render_schema_context` and
+`get_schema_description` now take an optional `question`; tables not scored
+relevant are rendered as a one-line summary instead of full column detail, with
+one-hop join-graph expansion so a bridge table is never dropped, and a fallback
+to "include everything" whenever scoring can't confidently narrow anything
+down), and curated few-shot examples (`examples:` in the metadata file,
+schema-validated at reconciliation like everything else, selected per question
+by the same lexical scoring and rendered as real prior chat turns rather than
+prompt prose). Both the CLI and web UI compute the pruned schema and matching
+examples fresh per question; see `context.relevant_tables`, `context.
+select_examples`, `SQLBrowserSession._query_context`, and `web.py`'s
+`run_query`.
+
 ---
 
 ## P1 — do these next
 
-### 1. Relevance-based prompt pruning
-
-**This is the blocker for real databases.** The renderer currently emits every
-table, every column and every value on every request.
-
-Measured on the 4-table sample database:
-
-| | Prompt size |
-| --- | --- |
-| Schema + profile + foreign keys | 2,263 chars |
-| ...plus `examples/sample.meta.yaml` | 5,376 chars (~1,344 tokens) |
-
-Metadata roughly 2.4×'d the prompt. Extrapolating linearly, a 40-table database
-lands near 54,000 chars — enough to blow a small model's context, and enough to
-bury the relevant tables among forty irrelevant ones even when it fits. Note the
-existing `MAX_ENUM_VALUES_IN_SCHEMA = 8` cap in `context.py` already exists
-because the unpruned approach doesn't scale.
-
-Proposed shape, in `context.py`:
-
-- **Always included** (cheap, globally useful): database description,
-  conventions, rules, glossary, one line per table, the complete join graph.
-- **Included on demand**: full column detail, value dictionaries, metrics and
-  few-shot examples — only for tables scored relevant to the current question.
-
-Scoring can start lexically: match question tokens against table/column names
-and the `synonyms` the metadata file already provides, then expand one hop along
-the join graph so a needed bridge table is never dropped. Embeddings later if
-lexical proves too blunt (`nomic-embed-text` is already a common local model).
-
-This requires threading the question into rendering. Today `schema_info` is built
-once at load time and reused (`cli.py` `start()`, `web.py` `load_file()`), so the
-signature becomes `render_schema_context(inspector, question=None)` with the
-current behaviour as the `None` case.
-
-Net effect for wide databases is a prompt *reduction* while carrying more useful
-signal — this pays for itself, and makes a 60-table database viable.
-
-### 2. Few-shot examples in the metadata file
-
-Curated question→SQL pairs are usually the single largest quality lever for
-small local models, and the schema for them is trivial:
-
-```yaml
-examples:
-  - question: how many orders shipped last month
-    sql: |
-      SELECT COUNT(*) FROM orders
-      WHERE status = 'S'
-        AND ordered_at >= date('now','start of month','-1 month')
-        AND ordered_at <  date('now','start of month')
-```
-
-Work involved:
-
-- `ExampleQuery` model in `metadata.py`.
-- Reconciliation should run each example's SQL through
-  `sql_guard.find_schema_problems()` and drop any that don't bind against the
-  live schema — the additive-only guarantee applied to examples. An example that
-  references a dropped column is worse than no example.
-- Render as actual prior turns in the message list rather than as prose in the
-  system prompt; models follow demonstrated format far better than described
-  format. That means `llm.translate_to_sql()` needs the examples, not just the
-  schema string.
-- Pair with pruning (#1): select examples by relevance, don't inject all of them.
+Empty for now - both items that were here (relevance-based prompt pruning and
+few-shot examples) shipped in Phase 2, above. The next tier of value is P2.
 
 ---
 
 ## P2 — clear value, more design needed
 
-### 3. Named metrics
+### 1. Named metrics
 
 ```yaml
 metrics:
@@ -104,7 +54,7 @@ or something the guard can substitute deterministically. The latter is much more
 valuable and much harder — it needs the metric's `requires` tables to be present
 and correctly joined in the generated query before substitution is safe.
 
-### 4. Metadata-aware join validation in `sql_guard.py`
+### 2. Metadata-aware join validation in `sql_guard.py`
 
 The relationship graph is currently advisory — it's in the prompt, but nothing
 checks the generated SQL against it. `sql_guard` could detect a join predicate
@@ -119,7 +69,7 @@ and correlated subqueries all need to pass. Given the graph is often incomplete
 (nobody documents every edge), leaning toward hints over blocks is not just
 safer, it's correct.
 
-### 5. Standalone metadata validation
+### 3. Standalone metadata validation
 
 Right now you have to start a session to find out your metadata file has drifted.
 A `--check-metadata` mode flag (following `--init-metadata`) that prints the
@@ -129,7 +79,7 @@ silently degrading prompts months later.
 
 Cheap: `resolve_metadata()` already returns exactly the warning list needed.
 
-### 6. Mitigating wrong-but-valid value codes
+### 4. Mitigating wrong-but-valid value codes
 
 Found during verification and worth recording precisely. Asked "how many orders
 are in transit?", `granite4.1:8b` generated `status = 'processing'`. The metadata
@@ -164,7 +114,7 @@ spike to see how often it fires falsely on a real database.
 
 ## P3 — worthwhile, not urgent
 
-### 7. Additional metadata sources
+### 5. Additional metadata sources
 
 The loader is deliberately source-agnostic, so these are drop-ins:
 
@@ -177,7 +127,7 @@ Excel is where this matters most — a workbook declares no foreign keys, so
 `relationships:` is the only way its sheets can be connected, and keeping that
 inside the workbook means it survives being copied.
 
-### 8. `pii` → result masking
+### 6. `pii` → result masking
 
 `pii: true` currently only annotates the prompt. It could also mask values in
 displayed results unless explicitly asked for. Needs a decision on where masking
@@ -185,7 +135,7 @@ belongs (`query_executor.py` for the CLI, the `/api/query` payload for the web
 UI) and an obvious escape hatch — a flag or a per-query override — since the
 whole point of a browser is sometimes to look at the data.
 
-### 9. Web UI metadata editing
+### 7. Web UI metadata editing
 
 The schema panel now shows descriptions and warnings read-only. Editing them in
 the browser and writing back to the YAML would close the loop for non-terminal
@@ -193,14 +143,16 @@ users. Meaningful work: needs a write endpoint, comment-preserving YAML
 round-tripping (a real `ruamel.yaml` dependency — the current hand-rolled writer
 only generates, it can't edit), and conflict handling if the file changed on disk.
 
-### 10. Test coverage for the web wiring
+### 8. Test coverage for the web wiring
 
-`metadata.py`, `context.py` and the CLI's metadata wiring are covered. The web
-side — `BrowserSession.load_file()` and the `/api/schema` payload — was verified
-by hand but isn't. `fastapi.testclient` works against `create_app()` and would
-cover it cheaply; `tests/test_cli.py` shows the pattern for stubbing out Ollama.
+`metadata.py`, `context.py` and the CLI's metadata wiring are covered.
+`tests/test_web.py` now covers the `/api/query` pruning/example wiring added in
+Phase 2 (see `fastapi.testclient` against `create_app()`, following the
+Ollama-stubbing pattern in `tests/test_cli.py`). Still uncovered by a test:
+`BrowserSession.load_file()` and the `/api/schema` payload - both verified by
+hand only.
 
-### 11. `default_time_column` is prompt-only
+### 9. `default_time_column` is prompt-only
 
 It tells the model which column "last month" means, and nothing enforces it. It
 could inform a deterministic check on relative date filters, in the same spirit
@@ -216,5 +168,5 @@ as the value corrector.
   Anything needing an override is really asking for a fix to the data or a view.
 - **A YAML round-tripping dependency for scaffolding.** The generator emits text
   directly so it can include explanatory comments, which `yaml.safe_dump` strips.
-  Only revisit this alongside #10, which genuinely needs editing rather than
-  generation.
+  Only revisit this alongside #7 (web UI metadata editing), which genuinely needs
+  editing rather than generation.

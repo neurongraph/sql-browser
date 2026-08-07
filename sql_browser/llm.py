@@ -2,7 +2,7 @@
 
 import json
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import ollama
 from json_repair import repair_json
@@ -67,31 +67,50 @@ class LLMQueryTranslator:
             )
 
     def translate_to_sql(
-        self, 
-        natural_query: str, 
+        self,
+        natural_query: str,
         schema_info: str,
-        conversation_history: Optional[list] = None
+        conversation_history: Optional[list] = None,
+        examples: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, str]:
         """Translate a natural language query to SQL.
-        
+
         Args:
             natural_query: The user's question in natural language
             schema_info: Database schema information
             conversation_history: Previous conversation for context
-            
+            examples: Curated `{"question": ..., "sql": ...}` pairs to
+                demonstrate as prior turns (see `context.select_examples`).
+                Rendered as chat turns rather than described in prose, because
+                a local model follows a demonstrated format far more reliably
+                than one only described in the system prompt.
+
         Returns:
             Dictionary with 'sql' and 'explanation' keys
         """
         system_prompt = self._build_system_prompt(schema_info)
-        
+
         messages = [
             {"role": "system", "content": system_prompt}
         ]
-        
+
+        # Curated examples precede real conversation history, so they read as
+        # demonstrated house style rather than as part of this exchange.
+        for example in examples or []:
+            messages.append({"role": "user", "content": example["question"]})
+            messages.append({
+                "role": "assistant",
+                "content": json.dumps({
+                    "sql": example["sql"],
+                    "explanation": "Curated example.",
+                    "confidence": "high",
+                }),
+            })
+
         # Add conversation history if provided
         if conversation_history:
             messages.extend(conversation_history)
-        
+
         # Add current query
         messages.append({
             "role": "user",

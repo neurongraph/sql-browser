@@ -163,3 +163,30 @@ relationships:
     note: >
       the only path from products to customers is
       products -> order_items -> orders -> customers
+
+examples:
+  # Shown to the model as demonstrated prior turns, not as prose - see
+  # BACKLOG.md #2. Each of these also shows a rule or glossary entry above
+  # actually being applied, which is a stronger signal than describing the
+  # rule alone.
+  - question: how many orders shipped last month
+    sql: |
+      SELECT COUNT(*) FROM orders
+      WHERE status = 'shipped'
+        AND order_date >= date('now', 'start of month', '-1 month')
+        AND order_date <  date('now', 'start of month')
+
+  - question: how much has each customer spent on delivered orders
+    sql: |
+      SELECT c.name, SUM(o.total_amount) AS total_spent
+      FROM customers c
+      JOIN orders o ON o.customer_id = c.id
+      WHERE o.status = 'delivered'
+      GROUP BY c.id
+      ORDER BY total_spent DESC
+
+  - question: what is the basket size of each order
+    sql: |
+      SELECT order_id, SUM(quantity) AS basket_size
+      FROM order_items
+      GROUP BY order_id

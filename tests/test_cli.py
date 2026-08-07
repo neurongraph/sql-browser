@@ -170,6 +170,50 @@ def test_no_metadata_session_still_reloads_cleanly(db_path):
         session.db_inspector.disconnect()
 
 
+# --------------------------------------------------------------------------- #
+# Per-question schema pruning and example selection (BACKLOG.md #1, #2)
+# --------------------------------------------------------------------------- #
+
+def test_query_context_uses_the_question_to_prune_and_pick_examples(db_path):
+    """The per-turn helper, not just self.schema_info, must carry both."""
+    sidecar = db_path.with_name("shop.meta.yaml")
+    sidecar.write_text(
+        "version: 1\n"
+        "examples:\n"
+        "  - question: how many orders are there\n"
+        "    sql: SELECT COUNT(*) FROM orders\n"
+    )
+
+    session = SQLBrowserSession(str(db_path), profile=False)
+    session.db_inspector.connect()
+    session.executor = QueryExecutor(session.db_inspector)
+    try:
+        session._load_metadata()
+
+        schema_info, examples = session._query_context("how many orders are there")
+
+        assert "Table: orders" in schema_info
+        assert examples == [
+            {"question": "how many orders are there", "sql": "SELECT COUNT(*) FROM orders"}
+        ]
+    finally:
+        session.db_inspector.disconnect()
+
+
+def test_query_context_without_metadata_returns_no_examples(db_path):
+    session = SQLBrowserSession(str(db_path), profile=False, use_metadata=False)
+    session.db_inspector.connect()
+    session.executor = QueryExecutor(session.db_inspector)
+    try:
+        session._load_metadata()
+
+        _, examples = session._query_context("how many orders are there")
+
+        assert examples == []
+    finally:
+        session.db_inspector.disconnect()
+
+
 def test_profile_command_rebuilds_the_prompt(db_path):
     """Profiling on demand has to reach the model too, not just the display."""
     session = SQLBrowserSession(str(db_path), profile=False)

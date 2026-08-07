@@ -38,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .database import DatabaseInspector
 from .logger import get_logger
+from .sql_guard import build_schema, find_schema_problems
 
 logger = get_logger(__name__)
 
@@ -228,6 +229,23 @@ class GlossaryTerm(_LenientModel):
     means: str
 
 
+class ExampleQuery(_LenientModel):
+    """A curated question -> SQL pair, used to few-shot the model.
+
+    Rendered as an actual prior turn in the chat (see
+    `LLMQueryTranslator.translate_to_sql`), not as prose in the schema text -
+    a demonstrated format is followed far more reliably than a described one,
+    which is the whole point of curating these. Reconciliation runs the SQL
+    through `sql_guard.find_schema_problems()` and drops anything that
+    doesn't bind against the live schema: an example referencing a dropped
+    column would actively teach the model the wrong thing, which is worse
+    than no example at all.
+    """
+
+    question: str
+    sql: str
+
+
 class DatabaseMeta(_LenientModel):
     """Database-wide context: what this data is and how to read it."""
 
@@ -246,6 +264,7 @@ class Metadata(_LenientModel):
     database: DatabaseMeta = Field(default_factory=DatabaseMeta)
     tables: Dict[str, TableMeta] = Field(default_factory=dict)
     relationships: List[Relationship] = Field(default_factory=list)
+    examples: List[ExampleQuery] = Field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -258,6 +277,7 @@ class Metadata(_LenientModel):
             or db.rules
             or self.tables
             or self.relationships
+            or self.examples
         )
 
     def table(self, name: str) -> TableMeta:
@@ -559,6 +579,33 @@ def _reconcile_relationships(
     return kept
 
 
+def _reconcile_examples(
+    metadata: Metadata, db_inspector: DatabaseInspector, warnings: List[str]
+) -> List[ExampleQuery]:
+    """Drop examples whose SQL doesn't bind against the live schema.
+
+    Applies the same additive-only guarantee as everything else here: an
+    example is only ever a hint for how to answer, so one that references a
+    dropped or renamed column must not survive to mislead the model - it's
+    strictly worse than having no example for that shape of question.
+    """
+    if not metadata.examples:
+        return []
+
+    schema = build_schema(db_inspector)
+    kept = []
+    for example in metadata.examples:
+        problems = find_schema_problems(example.sql, schema)
+        if problems:
+            warnings.append(
+                f"example {example.question!r}: SQL doesn't match the schema - "
+                f"ignored ({'; '.join(problems)})"
+            )
+            continue
+        kept.append(example)
+    return kept
+
+
 def reconcile(
     metadata: Metadata, db_inspector: DatabaseInspector
 ) -> Tuple[Metadata, List[str]]:
@@ -607,9 +654,14 @@ def reconcile(
     relationships = _reconcile_relationships(
         metadata, db_inspector, columns_by_table, warnings
     )
+    examples = _reconcile_examples(metadata, db_inspector, warnings)
 
     reconciled = metadata.model_copy(
-        update={"tables": kept_tables, "relationships": relationships}
+        update={
+            "tables": kept_tables,
+            "relationships": relationships,
+            "examples": examples,
+        }
     )
 
     for warning in warnings:
@@ -757,6 +809,8 @@ def build_scaffold(
         "    # - \"Exclude rows where is_test = 1 unless the user asks for test data.\"",
         "",
         "tables:",
+        # (examples: goes after tables: below, so it reads after the schema it
+        # refers to - see the block appended at the end of this scaffold.)
     ]
 
     for table in db_inspector.get_tables():
@@ -809,6 +863,19 @@ def build_scaffold(
         "  # - from: orders.customer_id",
         "  #   to: customers.id",
         "  #   cardinality: many_to_one",
+        "",
+        "examples: []",
+        "  # Curated question -> SQL pairs, shown to the model as demonstrations",
+        "  # rather than described in prose - the single biggest quality lever for",
+        "  # a small local model. Anything whose SQL doesn't match the schema is",
+        "  # dropped at load time, same as everything else here:",
+        "  #",
+        "  # - question: how many orders shipped last month",
+        "  #   sql: |",
+        "  #     SELECT COUNT(*) FROM orders",
+        "  #     WHERE status = 'shipped'",
+        "  #       AND order_date >= date('now', 'start of month', '-1 month')",
+        "  #       AND order_date <  date('now', 'start of month')",
         "",
     ]
     return "\n".join(lines)
