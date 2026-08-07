@@ -16,13 +16,10 @@ run db model=model:
 run-no-profile db model=model:
     uv run sql-browser --model {{model}} --no-profile {{db}}
 
-# Launch the browser-based UI against a SQLite db or Excel workbook
-web db model=model port="8000":
-    uv run sql-browser --web --port {{port}} --model "{{model}}" "{{db}}"
-
-# Launch the browser-based UI with no file or model preselected
-web-blank port="8000":
-    uv run sql-browser --web --port {{port}}
+# Launch the browser-based UI; db is optional (pick the file in the browser)
+web db="" model=model port="8000":
+    -lsof -ti tcp:{{port}} | xargs kill -9 2>/dev/null
+    uv run sql-browser --web --port {{port}} --model "{{model}}" {{ if db != "" { '"' + db + '"' } else { "" } }}
 
 # Generate the sample database and run sql-browser against it
 run-sample model=model:
