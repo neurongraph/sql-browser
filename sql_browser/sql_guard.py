@@ -63,15 +63,87 @@ def transpile_to_sqlite(sql: str) -> str:
     Only if that fails do we reinterpret under a more permissive dialect
     (MySQL) to rescue cross-dialect idioms. On total failure the original
     string is returned unchanged.
+
+    A `repair_compound_order_limit` pass runs on the result to fix a common
+    LLM mistake that even a successful transpile leaves in place.
     """
     for read in ("sqlite", "mysql", None):
         try:
             out = sqlglot.transpile(sql, read=read, write="sqlite")
             if out:
-                return out[0]
+                return repair_compound_order_limit(out[0])
         except Exception:
             continue
     return sql
+
+
+def repair_compound_order_limit(sql: str) -> str:
+    """Scope a per-branch ORDER BY / LIMIT inside a compound (UNION) query.
+
+    SQLite binds a trailing ``ORDER BY`` / ``LIMIT`` to the *whole* compound,
+    so local models produce two related mistakes when they mean a top row *per
+    branch*:
+
+    1. ``SELECT ... ORDER BY x LIMIT 1 UNION ALL SELECT ...`` -- a **syntax
+       error**, because an operand may not carry its own ORDER BY/LIMIT. The
+       parser leaves the earlier branches' clauses on their own SELECTs.
+    2. ``... UNION ALL SELECT c, ... GROUP BY c ORDER BY SUM(x) DESC LIMIT 1``
+       -- **valid but wrong**: the LIMIT silently truncates the whole union to
+       one row instead of picking the top row of the final grouped branch. The
+       parser hoists this trailing clause onto the compound node.
+
+    The fix wraps each offending operand in ``SELECT * FROM (...)`` so its
+    ordering/limit is scoped to a subquery, which SQLite accepts, and pushes a
+    hoisted trailing clause back onto the final branch first so it is limited
+    the same way. Mistake 2 is recognised only when the compound-level ORDER BY
+    contains an aggregate: such an expression is meaningless applied to a merged
+    union result, so it can only have been meant for the grouped branch. A plain
+    compound with a genuine top-level ``ORDER BY col LIMIT n`` (top-N of the
+    union) has neither an offending operand nor an aggregate and is returned
+    untouched. Any parse failure returns the input unchanged.
+    """
+    try:
+        expression = sqlglot.parse_one(sql, read="sqlite")
+    except Exception:
+        return sql
+    if not isinstance(expression, exp.SetOperation):
+        return sql
+
+    def operand_selects(node: exp.SetOperation):
+        # Yield the SELECT operands of a (possibly chained) set operation,
+        # left to right, so the last yielded is the rightmost branch.
+        for child in (node.this, node.expression):
+            if isinstance(child, exp.SetOperation):
+                yield from operand_selects(child)
+            elif isinstance(child, exp.Select):
+                yield child
+
+    branch_selects = list(operand_selects(expression))
+    has_branch_clause = any(
+        s.args.get("order") or s.args.get("limit") for s in branch_selects
+    )
+    compound_order = expression.args.get("order")
+    order_aggregates = compound_order is not None and compound_order.find(exp.AggFunc)
+    if not (has_branch_clause or order_aggregates):
+        return sql
+
+    # Per-branch idiom confirmed: reclaim the trailing clause the parser bound
+    # to the whole compound and give it back to the final branch.
+    final = branch_selects[-1]
+    for clause in ("order", "limit"):
+        value = expression.args.get(clause)
+        if value is not None and final.args.get(clause) is None:
+            final.set(clause, value)
+            expression.set(clause, None)
+
+    to_wrap = [
+        s for s in operand_selects(expression)
+        if s.args.get("order") or s.args.get("limit")
+    ]
+    for select in to_wrap:
+        select.replace(exp.select("*").from_(select.copy().subquery()))
+
+    return expression.sql(dialect="sqlite")
 
 
 def is_read_only(sql: str) -> bool:
