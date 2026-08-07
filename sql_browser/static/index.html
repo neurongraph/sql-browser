@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SQL Browser</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=4" />
+  <link rel="stylesheet" href="/static/style.css?v=6" />
 </head>
 <body>
   <header>
@@ -38,6 +38,24 @@
     <aside id="sidebar">
       <h2>Schema</h2>
       <div id="schema-tree" class="schema-tree">Loading…</div>
+
+      <!--
+        Persistent metadata editor. Collapsed by default; the same prose-editor
+        component the Excel review modal uses, bound to the RAW document. Preview
+        shows what reconciliation would keep/drop; Save regenerates and writes.
+      -->
+      <section id="metadata-editor" class="hidden">
+        <h2 id="metadata-toggle" class="collapsible">Metadata <span class="caret">▸</span></h2>
+        <div id="metadata-body" class="hidden">
+          <p id="metadata-hint" class="editor-hint"></p>
+          <div id="metadata-prose" class="prose-editor"></div>
+          <div id="metadata-recon" class="recon-summary"></div>
+          <div class="editor-actions">
+            <button type="button" id="metadata-preview" class="secondary">Preview</button>
+            <button type="button" id="metadata-save">Save</button>
+          </div>
+        </div>
+      </section>
     </aside>
 
     <main>
@@ -90,6 +108,41 @@
     </template>
   </div>
 
-  <script src="/static/app.js?v=4"></script>
+  <!--
+    Metadata review modal. Shown after loading an Excel workbook that carried a
+    documentation sheet: the extracted text is seeded into the prose editor so
+    the user can review, edit, and Save it as a sidecar (or discard the offer).
+    The prose editor here is the same component B1 mounts in the sidebar.
+  -->
+  <div id="metadata-review" class="modal-overlay hidden">
+    <div class="modal metadata-review">
+      <h2>Add metadata from this workbook</h2>
+      <p class="modal-intro">
+        This workbook has a documentation sheet
+        (<span id="mr-sheets"></span>). Its notes are below. Prose is canonical —
+        edit it freely; the structured YAML is generated from it and reconciled
+        against the real data when you Save.
+      </p>
+
+      <div id="mr-editor" class="prose-editor"></div>
+
+      <div id="mr-recon" class="recon-summary"></div>
+
+      <div class="modal-actions">
+        <button type="button" id="mr-discard" class="secondary">Discard</button>
+        <button type="button" id="mr-preview" class="secondary">Preview</button>
+        <button type="button" id="mr-save">Save metadata</button>
+      </div>
+    </div>
+  </div>
+
+  <template id="prose-field-template">
+    <label class="prose-field">
+      <span class="prose-label"></span>
+      <textarea class="prose-input" spellcheck="false" rows="4"></textarea>
+    </label>
+  </template>
+
+  <script src="/static/app.js?v=5"></script>
 </body>
 </html>

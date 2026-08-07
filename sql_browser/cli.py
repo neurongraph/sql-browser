@@ -12,7 +12,18 @@ from .context import select_examples
 from .database import DatabaseInspector
 from .excel_loader import EXCEL_EXTENSIONS, ExcelLoadError, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator
-from .metadata import build_scaffold, resolve_metadata
+from .metadata import (
+    MetadataError,
+    Metadata,
+    build_scaffold,
+    discover,
+    load,
+    load_prose,
+    reconcile,
+    regenerate_structured,
+    resolve_metadata,
+    write_document,
+)
 from .profiler import profile_database
 from .query_corrector import resolve_value_mismatches
 from .query_executor import QueryExecutor
@@ -451,6 +462,16 @@ class SQLBrowserSession:
         metadata = self.db_inspector.metadata
         console = self.executor.console
 
+        # Prose is canonical: note when the file carries one, so the reader knows
+        # the structured blocks below are generated (and `--regenerate-metadata`
+        # is the way to refresh them). Any staleness warning appears further down.
+        sidecar = discover(self.source_path) if self.use_metadata else None
+        if sidecar is not None and not load_prose(sidecar).is_empty:
+            console.print(
+                f"[dim]Prose present in {sidecar.name}; structured blocks below are "
+                f"generated from it (regenerate with --regenerate-metadata).[/dim]"
+            )
+
         if metadata is None or metadata.is_empty:
             self.executor.display_info(
                 "No metadata loaded. Create a starter file with:\n"
@@ -634,6 +655,100 @@ def _init_metadata(source: Path, model: str, use_llm: bool) -> None:
     typer.echo("It is picked up automatically next time you open this file.")
 
 
+def _count_items(metadata: Metadata) -> int:
+    """Count the leaf facts kept after reconciliation, for the CLI report."""
+    total = len(metadata.tables) + len(metadata.relationships) + len(metadata.examples)
+    for table_meta in metadata.tables.values():
+        total += len(table_meta.columns)
+        for column_meta in table_meta.columns.values():
+            total += len(column_meta.values)
+    return total
+
+
+def _regenerate_metadata(source: Path, model: str) -> None:
+    """Regenerate a sidecar's structured blocks from its canonical prose.
+
+    The command-line twin of the web editor's Save: it parses the prose the
+    file already carries, reconciles the result against the live schema, and
+    rewrites the derived blocks - so a prose edit made in an editor becomes
+    real metadata without opening the web UI. Unlike ``--init-metadata`` this
+    *requires* an existing prose-bearing sidecar; it never creates one from
+    scratch.
+
+    Args:
+        source: The database or workbook whose sidecar to regenerate
+        model: Ollama model used to parse the prose
+
+    Raises:
+        typer.Exit: No sidecar exists, or its prose is empty (nothing to do)
+    """
+    sidecar = discover(source)
+    if sidecar is None:
+        typer.echo(
+            f"Error: no metadata file found for '{source.name}'. Create one first "
+            f"with:\n  sql-browser --init-metadata {source.name}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    prose = load_prose(sidecar)
+    if prose.is_empty:
+        typer.echo(
+            f"Error: {sidecar.name} has no `prose:` block to regenerate from. "
+            "Add prose (in the file or the web editor) first.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        existing = load(sidecar)
+    except MetadataError:
+        # The prose is what we're regenerating from; unreadable structured
+        # blocks just mean nothing to preserve for prose-less sections.
+        existing = Metadata()
+
+    temp_db_path: Optional[Path] = None
+    if source.suffix.lower() in EXCEL_EXTENSIONS:
+        temp_db_path = convert_xlsx_to_sqlite(source)
+        db_path = temp_db_path
+    else:
+        db_path = source
+
+    inspector = DatabaseInspector(str(db_path))
+    try:
+        inspector.connect()
+
+        # Reconciliation needs the profiled categorical values to keep a code
+        # dictionary the prose describes, exactly as the web Save path does.
+        typer.echo("Profiling database...")
+        inspector.profile = profile_database(inspector)
+
+        llm = LLMQueryTranslator(model=model)
+        typer.echo("Parsing prose into structured metadata...")
+        raw, gen_warnings = regenerate_structured(
+            prose, llm, inspector, existing=existing
+        )
+        reconciled, recon_warnings = reconcile(raw, inspector)
+
+        write_document(
+            sidecar, prose, raw, source_name=source.name, model=model
+        )
+    finally:
+        inspector.disconnect()
+        if temp_db_path:
+            temp_db_path.unlink(missing_ok=True)
+
+    warnings = gen_warnings + recon_warnings
+    typer.echo(
+        f"\nWrote {sidecar} "
+        f"({_count_items(reconciled)} fact(s) kept, {len(recon_warnings)} dropped)."
+    )
+    if warnings:
+        typer.echo(f"\n{len(warnings)} warning(s):", err=True)
+        for warning in warnings:
+            typer.echo(f"  - {warning}", err=True)
+
+
 app = typer.Typer(
     name="sql-browser",
     help="SQL Browser - Natural language SQLite database explorer",
@@ -699,6 +814,12 @@ def cli(
         help="With --init-metadata, have the LLM draft descriptions to correct "
         "(slower; one request per table)",
     ),
+    regenerate_metadata: bool = typer.Option(
+        False,
+        "--regenerate-metadata",
+        help="Regenerate an existing sidecar's structured blocks from its prose "
+        "and exit (the command-line twin of the web editor's Save)",
+    ),
     web: bool = typer.Option(
         False,
         "--web",
@@ -742,6 +863,7 @@ def cli(
       sql-browser --web mydata.db
       sql-browser --web                    # pick the file in the browser
       sql-browser --init-metadata mydata.db    # write mydata.meta.yaml
+      sql-browser --regenerate-metadata mydata.db  # rebuild it from its prose
       sql-browser --metadata shared.meta.yaml mydata.db
     """
     if data_dir:
@@ -764,6 +886,14 @@ def cli(
         )
         raise typer.Exit(1)
 
+    if init_metadata and regenerate_metadata:
+        typer.echo(
+            "Error: --init-metadata creates a new file; --regenerate-metadata "
+            "rebuilds an existing one. Pass one or the other.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     # Write a metadata skeleton and exit, rather than starting a session.
     if init_metadata:
         if database is None:
@@ -774,6 +904,25 @@ def cli(
             raise typer.Exit(1)
         try:
             _init_metadata(database, model or DEFAULT_MODEL, llm_draft)
+        except ExcelLoadError as e:
+            logger.error(f"Failed to load Excel workbook: {e}")
+            typer.echo(f"Error: could not load '{database.name}':", err=True)
+            for issue in e.issues:
+                typer.echo(f"  - {issue}", err=True)
+            raise typer.Exit(1)
+        return
+
+    # Regenerate an existing sidecar's structured blocks from its prose and exit.
+    if regenerate_metadata:
+        if database is None:
+            typer.echo(
+                "Error: --regenerate-metadata needs the database or workbook the "
+                "sidecar documents.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        try:
+            _regenerate_metadata(database, model or DEFAULT_MODEL)
         except ExcelLoadError as e:
             logger.error(f"Failed to load Excel workbook: {e}")
             typer.echo(f"Error: could not load '{database.name}':", err=True)

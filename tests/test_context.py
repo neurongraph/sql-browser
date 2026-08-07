@@ -310,4 +310,59 @@ def test_select_examples_respects_the_limit():
 def test_select_examples_with_no_examples_is_a_noop():
     assert context.select_examples("how many orders", []) == []
 
+
+# --------------------------------------------------------------------------- #
+# Prose-parse prompt construction (the interface to the parsing model)
+# --------------------------------------------------------------------------- #
+
+def test_schema_hint_for_table_uses_real_names_and_profiled_codes(inspector):
+    hint = context.schema_hint_for_table(inspector, "orders")
+
+    assert "Table: orders" in hint
+    assert "use these exact names" in hint
+    # status is categorical, so its actual codes are offered to the parser.
+    assert "status" in hint
+    assert "'P'" in hint and "'S'" in hint
+
+
+def test_schema_hint_for_db_lists_every_table(inspector):
+    hint = context.schema_hint_for_db(inspector)
+
+    assert "orders(" in hint
+    assert "customers(" in hint
+
+
+def test_build_prose_parse_prompt_carries_section_prose_and_hint(inspector):
+    hint = context.schema_hint_for_table(inspector, "orders")
+    prompt = context.build_prose_parse_prompt(
+        "table", "status: P means Pending", hint, table="orders"
+    )
+
+    assert "the table 'orders'" in prompt
+    assert "status: P means Pending" in prompt  # the prose itself
+    assert "Table: orders" in prompt  # the schema hint
+    assert "JSON only" in prompt
+    # The table contract's distinctive fields are present.
+    assert '"grain"' in prompt
+
+
+def test_build_prose_parse_prompt_sections_differ():
+    """Each section gets its own JSON contract, not a generic one."""
+    db = context.build_prose_parse_prompt("database", "notes", "hint")
+    rel = context.build_prose_parse_prompt("relationships", "notes", "hint")
+
+    assert '"conventions"' in db
+    assert '"relationships"' in rel
+    assert '"conventions"' not in rel
+
+
+def test_metadata_sheet_classifier_prompt_includes_title_and_sample():
+    prompt = context.build_metadata_sheet_classifier_prompt(
+        "Notes", "BGC | Bank Giro Credit"
+    )
+
+    assert "Notes" in prompt
+    assert "BGC | Bank Giro Credit" in prompt
+    assert '"kind"' in prompt
+
 # Made with Bob

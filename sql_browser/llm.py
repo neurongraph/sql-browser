@@ -476,4 +476,93 @@ are not listed above."""
             logger.warning(f"Metadata draft failed for table '{table}': {e}")
             return {}
 
+    def parse_prose_to_metadata(
+        self,
+        section: str,
+        prose_text: str,
+        schema_hint: str,
+        table: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Parse one free-form prose section into a structured JSON stanza.
+
+        This is the single LLM step behind ``metadata.regenerate_structured``.
+        Like ``draft_metadata`` it runs once per unit (database, one table,
+        relationships, examples) so a single bad response costs one stanza, and
+        it only ever *proposes*: the result is reconciled against the real schema
+        before anything downstream trusts it.
+
+        Args:
+            section: One of "database", "table", "relationships", "examples"
+            prose_text: The human's free-form notes for this section
+            schema_hint: Real schema names/codes (from context.schema_hint_*)
+            table: The table name, when section == "table"
+
+        Returns:
+            The parsed JSON object, or an empty dict if the model failed.
+        """
+        from . import context
+
+        prompt = context.build_prose_parse_prompt(
+            section, prose_text, schema_hint, table=table
+        )
+        label = f"table '{table}'" if table else section
+
+        try:
+            logger.info(f"Parsing prose for {label} ({len(prompt)} chars)")
+            start = time.monotonic()
+            response = ollama.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                format="json",
+            )
+            logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
+
+            content = response["message"]["content"].strip()
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                result = json.loads(repair_json(content))
+
+            if not isinstance(result, dict):
+                logger.warning(f"Prose parse for {label} was not a JSON object")
+                return {}
+            return result
+
+        except Exception as e:
+            # Parsing is best-effort: a failure leaves that one section empty and
+            # is surfaced as a warning, never a crashed session.
+            logger.warning(f"Prose parse failed for {label}: {e}")
+            return {}
+
+    def classify_sheet(self, title: str, sample: str) -> Optional[str]:
+        """Decide whether an ambiguous spreadsheet tab is data or documentation.
+
+        Consulted (see excel_loader.plan_sheets) only for a sheet whose name is
+        ambiguous *and* whose layout isn't a clean table, so the common case -
+        a documentation tab caught by name - never spends a call here.
+
+        Returns:
+            "data", "metadata", or None when the model can't be reached or gives
+            an unusable answer - callers treat None as "assume data".
+        """
+        from . import context
+
+        prompt = context.build_metadata_sheet_classifier_prompt(title, sample)
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                format="json",
+            )
+            content = response["message"]["content"].strip()
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                result = json.loads(repair_json(content))
+            kind = result.get("kind") if isinstance(result, dict) else None
+            return kind if kind in ("data", "metadata") else None
+        except Exception as e:
+            logger.warning(f"Sheet classification failed for '{title}': {e}")
+            return None
+
 # Made with Bob

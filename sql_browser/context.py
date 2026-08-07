@@ -497,4 +497,138 @@ def render_schema_context(
 
     return "\n".join(lines)
 
+
+# --------------------------------------------------------------------------- #
+# Prompts for turning free-form prose into structured metadata
+# --------------------------------------------------------------------------- #
+#
+# Prose is the canonical metadata a human writes; the structured YAML blocks are
+# generated from it by the LLM (metadata.regenerate_structured) and then
+# reconciled against the real schema. Every prompt string for that pipeline
+# lives here, because prompt text is a shared resource - the same reason the
+# schema rendering above is centralised.
+
+
+def schema_hint_for_table(db_inspector: "DatabaseInspector", table: str) -> str:
+    """A compact schema note for one table: real column names, types, codes.
+
+    The prose the model parses uses human labels ("Transaction Type"), but the
+    database column is the *sanitized* identifier ("Transaction_Type"). Handing
+    the model the real names plus the codes a categorical column actually holds
+    is what lets it target them; ``reconcile()`` is the backstop that drops
+    anything it still gets wrong.
+    """
+    lines = [f"Table: {table}", "Columns (use these exact names):"]
+    profiles = db_inspector.profile.get(table, {})
+    for col in db_inspector.get_table_schema(table):
+        name = col["name"]
+        entry = f"  - {name} ({col['type']})"
+        profile = profiles.get(name)
+        if profile and profile.get("type") == "enum":
+            codes = ", ".join(repr(str(v)) for v in profile["values"][:20])
+            entry += f" - values in the data: {codes}"
+        elif profile and profile.get("type") == "range":
+            entry += f" - range {profile['min']} to {profile['max']}"
+        lines.append(entry)
+    return "\n".join(lines)
+
+
+def schema_hint_for_db(db_inspector: "DatabaseInspector") -> str:
+    """A one-line-per-table overview, for the database/relationships/examples parses."""
+    lines = ["Tables (use these exact table.column names):"]
+    for table in db_inspector.get_tables():
+        columns = ", ".join(col["name"] for col in db_inspector.get_table_schema(table))
+        lines.append(f"  - {table}({columns})")
+    return "\n".join(lines)
+
+
+#: Per-section JSON contract handed to the model. Each describes exactly the
+#: shape metadata.regenerate_structured knows how to validate.
+_PROSE_PARSE_CONTRACT = {
+    "database": (
+        "Respond with a JSON object describing the database as a whole:\n"
+        '  "description": one or two sentences on what this data is\n'
+        '  "conventions": object mapping a short label to how a value is stored '
+        '(e.g. {"currency": "amounts in GBP; debits negative"})\n'
+        '  "glossary": array of {"term": ..., "means": ...} for business terms\n'
+        '  "rules": array of standing instructions applied to every query\n'
+        "Omit any field you have nothing for; never invent conventions."
+    ),
+    "table": (
+        "Respond with a JSON object describing this one table:\n"
+        '  "description": one sentence on what the table holds\n'
+        '  "grain": what a single row represents, as a short noun phrase\n'
+        '  "synonyms": array of other words a user might call this table\n'
+        '  "columns": object mapping a column name (use the exact names above) to\n'
+        '    {"description": short phrase,\n'
+        '     "values": object mapping each code IN THE DATA to {"label": meaning}}\n'
+        "Only describe columns and codes listed above; do not invent any. Map a "
+        "code to its plain-English meaning only when the code is not self-evident."
+    ),
+    "relationships": (
+        "Respond with a JSON object {\"relationships\": [...]} where each edge is\n"
+        '  {"from": "table.column", "to": "table.column",\n'
+        '   "cardinality": "many_to_one" | "one_to_many" | "one_to_one",\n'
+        '   "note": optional short explanation}\n'
+        "Use only the exact table.column names above. For a composite key, give a "
+        'comma-separated list on each side ("a.x, a.y"). Return an empty array if '
+        "the notes describe no joins."
+    ),
+    "examples": (
+        "Respond with a JSON object {\"examples\": [...]} where each item is\n"
+        '  {"question": a natural-language question, "sql": a single read-only '
+        "SQL query that answers it}\n"
+        "Use only the tables and columns above. Return an empty array if the notes "
+        "contain no worked examples."
+    ),
+}
+
+
+def build_prose_parse_prompt(
+    section: str,
+    prose_text: str,
+    schema_hint: str,
+    table: Optional[str] = None,
+) -> str:
+    """Build the prompt that turns one prose section into structured JSON.
+
+    Args:
+        section: One of "database", "table", "relationships", "examples"
+        prose_text: The free-form notes the human wrote for this section
+        schema_hint: Real schema names/codes from ``schema_hint_for_*``
+        table: The table name, when ``section == "table"``
+
+    Returns:
+        A prompt string; the caller requests ``format="json"``.
+    """
+    contract = _PROSE_PARSE_CONTRACT.get(section, _PROSE_PARSE_CONTRACT["database"])
+    subject = f"the table '{table}'" if section == "table" and table else "the database"
+    return (
+        f"You are converting a person's free-form notes about {subject} into "
+        "structured metadata. The notes may be prose or a bulleted list.\n\n"
+        f"{schema_hint}\n\n"
+        "Notes:\n"
+        f"{prose_text}\n\n"
+        f"{contract}\n\n"
+        "Base every field only on the notes and the real schema above. Respond "
+        "with JSON only."
+    )
+
+
+def build_metadata_sheet_classifier_prompt(title: str, sample: str) -> str:
+    """Prompt to decide whether an ambiguous spreadsheet tab is data or docs.
+
+    Consulted (see excel_loader.plan_sheets) only for a sheet whose name is
+    ambiguous and whose layout isn't a clean table - the common case being a
+    hand-written notes/glossary tab with blank separator rows.
+    """
+    return (
+        "A spreadsheet tab is either DATA (a table of records) or DOCUMENTATION "
+        "(notes, a glossary, or code lookups describing the data).\n\n"
+        f"Tab name: {title}\n"
+        "Contents (first rows):\n"
+        f"{sample}\n\n"
+        'Respond with JSON {"kind": "data"} or {"kind": "metadata"}.'
+    )
+
 # Made with Bob

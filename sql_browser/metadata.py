@@ -30,11 +30,18 @@ no authoring at all - and an Excel workbook, which has no constraints to read,
 gets one as soon as someone writes the relationships down.
 """
 
+import hashlib
+import io
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
+from ruamel.yaml.scalarstring import LiteralScalarString
 
 from .database import DatabaseInspector
 from .logger import get_logger
@@ -289,6 +296,60 @@ class Metadata(_LenientModel):
         return self.table(table).columns.get(column) or ColumnMeta()
 
 
+class Prose(_LenientModel):
+    """The canonical, free-form metadata a human actually edits.
+
+    The structured blocks above (``Metadata``) are a *generated* artifact: the
+    LLM parses each of these prose sections into a structured stanza, which is
+    then reconciled against the real schema. Prose is therefore the source of
+    truth, and the structured blocks are overwritten on Save. ``tables`` is keyed
+    by the real (sanitized) table name so each table is parsed on its own - one
+    bad LLM response costs one table, mirroring ``draft_metadata``.
+
+    Every section is optional. A section left blank is not regenerated; its
+    existing structured block is preserved untouched (see
+    ``regenerate_structured``), which is what keeps a hand-authored legacy file
+    from being wiped by a Save.
+    """
+
+    database: Optional[str] = None
+    tables: Dict[str, str] = Field(default_factory=dict)
+    relationships: Optional[str] = None
+    examples: Optional[str] = None
+
+    @field_validator("database", "relationships", "examples", mode="before")
+    @classmethod
+    def _clean_text(cls, value: Any) -> Any:
+        """Strip surrounding whitespace and treat an all-blank block as absent.
+
+        This keeps the prose digest stable: an editor that submits ``""`` or a
+        trailing newline for an untouched section must hash the same as one that
+        omits it, or the file would look perpetually stale.
+        """
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("tables", mode="before")
+    @classmethod
+    def _clean_tables(cls, value: Any) -> Any:
+        """Stringify keys and drop tables whose prose is blank."""
+        if not isinstance(value, dict):
+            return value
+        cleaned = {}
+        for name, text in value.items():
+            if isinstance(text, str) and text.strip():
+                cleaned[str(name)] = text.strip()
+        return cleaned
+
+    @property
+    def is_empty(self) -> bool:
+        """True when there's no prose to regenerate structured metadata from."""
+        return not (
+            self.database or self.tables or self.relationships or self.examples
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -387,6 +448,62 @@ def load(path: Path) -> Metadata:
         return Metadata.model_validate(raw)
     except Exception as e:
         raise MetadataError(f"{path.name}: {e}")
+
+
+def _read_yaml_mapping(path: Path) -> Optional[dict]:
+    """Read a YAML file as a mapping, or return None. Never raises.
+
+    The prose helpers below all degrade to "no prose" rather than failing: a
+    legacy file with no ``prose:`` key, or an unreadable one, must still load a
+    session, exactly as ``load`` treats a missing curated block.
+    """
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def load_prose(path: Path) -> Prose:
+    """Load the canonical ``prose:`` block from a sidecar. Never raises.
+
+    A legacy structured-only file (no ``prose:`` key) yields an empty ``Prose``,
+    so nothing about the existing hand-authored workflow changes.
+    """
+    raw = _read_yaml_mapping(path)
+    if raw is None:
+        return Prose()
+    block = raw.get("prose")
+    if not isinstance(block, dict):
+        return Prose()
+    try:
+        return Prose.model_validate(block)
+    except Exception as e:
+        logger.warning(f"Metadata: couldn't parse prose in {path.name}: {e}")
+        return Prose()
+
+
+def load_generated_digest(path: Path) -> Optional[str]:
+    """Return the prose digest recorded the last time blocks were generated.
+
+    Used to detect prose that has been edited since its structured blocks were
+    generated (a staleness warning), without ever calling the LLM at load time.
+    """
+    raw = _read_yaml_mapping(path)
+    if raw is None:
+        return None
+    generated = raw.get("_generated")
+    if isinstance(generated, dict) and generated.get("from_prose_digest"):
+        return str(generated["from_prose_digest"])
+    return None
+
+
+def prose_digest(prose: Prose) -> str:
+    """A stable content hash of the prose, used to detect staleness on load."""
+    payload = json.dumps(
+        prose.model_dump(exclude_none=True), sort_keys=True, ensure_ascii=False
+    )
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -715,7 +832,268 @@ def resolve_metadata(
             metadata = Metadata()
 
     reconciled, reconcile_warnings = reconcile(metadata, db_inspector)
+
+    # Staleness check: prose is canonical, so if it has been edited since the
+    # structured blocks were generated, those blocks are out of date. This is
+    # LLM-free - regeneration only ever happens on an explicit Save.
+    if path is not None:
+        prose = load_prose(path)
+        if not prose.is_empty and load_generated_digest(path) != prose_digest(prose):
+            warnings.append(
+                "metadata prose has changed since the structured blocks were last "
+                "generated - open the metadata editor and Save to regenerate them"
+            )
+
     return reconciled, warnings + reconcile_warnings
+
+
+# --------------------------------------------------------------------------- #
+# Regenerating structured metadata from prose (the only LLM step)
+# --------------------------------------------------------------------------- #
+
+def _coerce_list(raw: Any, key: str) -> List[Any]:
+    """Pull a list out of an LLM JSON reply.
+
+    ``format="json"`` forces the model to return an object, so a list section
+    (relationships, examples) arrives as ``{"relationships": [...]}``; accept
+    either that or a bare list, and anything else as empty.
+    """
+    if isinstance(raw, dict):
+        items = raw.get(key)
+    else:
+        items = raw
+    return items if isinstance(items, list) else []
+
+
+def _coerce_relationships(raw: Any, warnings: List[str]) -> List["Relationship"]:
+    result: List[Relationship] = []
+    for item in _coerce_list(raw, "relationships"):
+        try:
+            result.append(Relationship.model_validate(item))
+        except Exception:
+            warnings.append("relationships prose: skipped an edge the model returned")
+    return result
+
+
+def _coerce_examples(raw: Any, warnings: List[str]) -> List["ExampleQuery"]:
+    result: List[ExampleQuery] = []
+    for item in _coerce_list(raw, "examples"):
+        try:
+            result.append(ExampleQuery.model_validate(item))
+        except Exception:
+            warnings.append("examples prose: skipped an example the model returned")
+    return result
+
+
+def regenerate_structured(
+    prose: Prose,
+    llm: Any,
+    db_inspector: DatabaseInspector,
+    existing: Optional[Metadata] = None,
+) -> Tuple[Metadata, List[str]]:
+    """Parse the prose sections into structured metadata via the LLM.
+
+    One LLM call per unit - the database, each named table, relationships, and
+    examples - mirroring ``draft_metadata`` so a single bad response costs one
+    stanza rather than the whole document. A section with no prose is *not*
+    regenerated: its block is copied verbatim from ``existing``, which is what
+    lets a legacy hand-authored file survive a Save untouched.
+
+    The result is deliberately **RAW** - not reconciled. ``reconcile()`` remains
+    the single gate that enforces the additive-never-authoritative guarantee, so
+    the LLM here only ever *proposes*; nothing it returns is trusted until it has
+    been checked against the live schema.
+
+    Args:
+        prose: The canonical prose to parse
+        llm: An object exposing ``parse_prose_to_metadata(section, prose_text,
+            schema_hint, table=None) -> dict`` (LLMQueryTranslator, or a stub)
+        db_inspector: A connected, ideally profiled inspector, for schema hints
+        existing: Previously loaded structured metadata, for section preservation
+
+    Returns:
+        (raw structured metadata, human-readable warnings)
+    """
+    # Local import: context imports metadata at module load, so importing it at
+    # the top here would be a cycle.
+    from . import context
+
+    existing = existing or Metadata()
+    warnings: List[str] = []
+
+    def parse(section: str, text: str, hint: str, table: Optional[str] = None) -> Any:
+        try:
+            return llm.parse_prose_to_metadata(section, text, hint, table=table)
+        except Exception as e:
+            label = f"table '{table}'" if table else section
+            warnings.append(f"{label} prose: the model call failed ({e}) - left empty")
+            return {}
+
+    # Database-wide context.
+    if prose.database:
+        hint = context.schema_hint_for_db(db_inspector)
+        raw = parse("database", prose.database, hint)
+        if not raw:
+            warnings.append("database prose: the model returned nothing usable - left empty")
+            database = DatabaseMeta()
+        else:
+            try:
+                database = DatabaseMeta.model_validate(raw)
+            except Exception as e:
+                warnings.append(f"database prose: couldn't read the model output ({e})")
+                database = DatabaseMeta()
+    else:
+        database = existing.database
+
+    # One call per table named in the prose.
+    tables: Dict[str, TableMeta] = {}
+    for name, text in prose.tables.items():
+        hint = context.schema_hint_for_table(db_inspector, name)
+        raw = parse("table", text, hint, table=name)
+        if not raw:
+            warnings.append(f"table '{name}' prose: the model returned nothing usable - left empty")
+            tables[name] = TableMeta()
+            continue
+        try:
+            tables[name] = TableMeta.model_validate(raw)
+        except Exception as e:
+            warnings.append(f"table '{name}' prose: couldn't read the model output ({e})")
+            tables[name] = TableMeta()
+    # Preserve structured blocks for tables the prose doesn't mention.
+    for name, table_meta in existing.tables.items():
+        if name not in prose.tables:
+            tables[name] = table_meta
+
+    if prose.relationships:
+        hint = context.schema_hint_for_db(db_inspector)
+        relationships = _coerce_relationships(
+            parse("relationships", prose.relationships, hint), warnings
+        )
+    else:
+        relationships = existing.relationships
+
+    if prose.examples:
+        hint = context.schema_hint_for_db(db_inspector)
+        examples = _coerce_examples(parse("examples", prose.examples, hint), warnings)
+    else:
+        examples = existing.examples
+
+    structured = Metadata(
+        version=SUPPORTED_VERSION,
+        database=database,
+        tables=tables,
+        relationships=relationships,
+        examples=examples,
+    )
+    return structured, warnings
+
+
+# --------------------------------------------------------------------------- #
+# Writing the sidecar (comment-preserving round-trip)
+# --------------------------------------------------------------------------- #
+
+def _new_yaml() -> YAML:
+    """A round-trip YAML configured to preserve comments and not wrap scalars."""
+    y = YAML()
+    y.preserve_quotes = True
+    y.width = 4096  # don't line-wrap long descriptions
+    y.indent(mapping=2, sequence=4, offset=2)
+    return y
+
+
+def _prose_to_yaml(prose: Prose) -> CommentedMap:
+    """Render the prose block, each section as a literal (`|`) scalar."""
+    block = CommentedMap()
+    if prose.database:
+        block["database"] = LiteralScalarString(prose.database)
+    if prose.tables:
+        tables = CommentedMap()
+        for name, text in prose.tables.items():
+            tables[name] = LiteralScalarString(text)
+        block["tables"] = tables
+    if prose.relationships:
+        block["relationships"] = LiteralScalarString(prose.relationships)
+    if prose.examples:
+        block["examples"] = LiteralScalarString(prose.examples)
+    return block
+
+
+def _generated_stamp(prose: Prose, model: Optional[str]) -> CommentedMap:
+    """The provenance block that ties structured output to the prose it came from."""
+    stamp = CommentedMap()
+    stamp["from_prose_digest"] = prose_digest(prose)
+    stamp["model"] = model or ""
+    stamp["at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return stamp
+
+
+def write_document(
+    path: Path,
+    prose: Prose,
+    structured: Metadata,
+    *,
+    source_name: str,
+    model: Optional[str] = None,
+) -> None:
+    """Write a prose-canonical sidecar, preserving anything hand-authored.
+
+    Prose is written as the canonical ``prose:`` block. Derived structured blocks
+    are rewritten **only for sections that have prose** - a section left blank in
+    the prose keeps whatever is on disk, comments and all, so opening and saving a
+    legacy file never wipes its hand-authored blocks. Comment/key preservation is
+    what ``ruamel.yaml`` buys us over the hand-rolled scaffold writer.
+
+    Args:
+        path: Sidecar path (next to the source/workbook, not the temp database)
+        prose: The canonical prose to persist
+        structured: Raw structured metadata from ``regenerate_structured``
+        source_name: For the header comment on a freshly created file
+        model: Model name recorded in the ``_generated`` provenance stamp
+    """
+    yaml_rt = _new_yaml()
+
+    doc: Optional[CommentedMap] = None
+    if path.is_file():
+        try:
+            loaded = yaml_rt.load(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, CommentedMap):
+                doc = loaded
+        except Exception as e:
+            logger.warning(f"Metadata: couldn't round-trip {path.name}, rewriting: {e}")
+
+    if doc is None:
+        doc = CommentedMap()
+        doc.yaml_set_start_comment(
+            f"Metadata for {source_name}\n"
+            "PROSE IS CANONICAL. Edit the `prose:` blocks below; the structured\n"
+            "blocks are generated from prose and reconciled against the real schema,\n"
+            "so they are overwritten on Save - don't hand-edit them.\n"
+        )
+
+    doc["version"] = SUPPORTED_VERSION
+    doc["prose"] = _prose_to_yaml(prose)
+    doc["_generated"] = _generated_stamp(prose, model)
+
+    dumped = structured.model_dump(by_alias=True, exclude_defaults=True)
+    if prose.database:
+        doc["database"] = dumped.get("database", {})
+    if prose.tables:
+        table_blocks = doc.get("tables")
+        if not isinstance(table_blocks, CommentedMap):
+            table_blocks = CommentedMap()
+            doc["tables"] = table_blocks
+        dumped_tables = dumped.get("tables", {})
+        for name in prose.tables:
+            if name in dumped_tables:
+                table_blocks[name] = dumped_tables[name]
+    if prose.relationships:
+        doc["relationships"] = dumped.get("relationships", [])
+    if prose.examples:
+        doc["examples"] = dumped.get("examples", [])
+
+    stream = io.StringIO()
+    yaml_rt.dump(doc, stream)
+    path.write_text(stream.getvalue(), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -793,6 +1171,18 @@ def build_scaffold(
         "# Fill in what matters and delete the rest. Empty entries are ignored.",
         "",
         f"version: {SUPPORTED_VERSION}",
+        "",
+        "prose:",
+        "  # Canonical, free-form metadata. Write plain prose or bulleted lists here",
+        "  # and regenerate the structured blocks below from it (the web editor's Save,",
+        "  # or `sql-browser --regenerate-metadata`). Leave this empty to hand-author",
+        "  # the structured blocks directly, exactly as before.",
+        "  #",
+        "  # database: |",
+        "  #   What this data is; storage conventions worth stating up front.",
+        "  # tables: {}",
+        "  # relationships: |",
+        "  # examples: |",
         "",
         "database:",
         "  description: \"\"",

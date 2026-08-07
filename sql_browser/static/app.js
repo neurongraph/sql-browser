@@ -16,6 +16,22 @@ const els = {
   modelSelect: $("model-select"),
   loadBtn: $("load-btn"),
   toolbarStatus: $("toolbar-status"),
+  proseFieldTemplate: $("prose-field-template"),
+  metaReview: $("metadata-review"),
+  mrSheets: $("mr-sheets"),
+  mrEditor: $("mr-editor"),
+  mrRecon: $("mr-recon"),
+  mrDiscard: $("mr-discard"),
+  mrPreview: $("mr-preview"),
+  mrSave: $("mr-save"),
+  metaEditor: $("metadata-editor"),
+  metaToggle: $("metadata-toggle"),
+  metaBody: $("metadata-body"),
+  metaHint: $("metadata-hint"),
+  metaProse: $("metadata-prose"),
+  metaRecon: $("metadata-recon"),
+  metaPreviewBtn: $("metadata-preview"),
+  metaSaveBtn: $("metadata-save"),
 };
 
 // Mirrors the server's bound file/model so we can tell a real change from a
@@ -91,8 +107,11 @@ async function loadConfig() {
   if (state.ready) {
     loadSchema();
     loadSuggestions();
+    loadMetadata();
+    maybeShowMetadataReview(data);
   } else {
     els.schemaTree.textContent = "No file loaded.";
+    hide(els.metaEditor);
   }
 }
 
@@ -135,6 +154,8 @@ async function loadSession(force = false) {
       els.schemaTree.textContent = "Loading…";
       await loadSchema();
       loadSuggestions();
+      loadMetadata();
+      maybeShowMetadataReview(data);
     }
   } catch (e) {
     setToolbarStatus("Request failed: " + e.message, true);
@@ -309,6 +330,207 @@ async function loadSuggestions() {
   } catch (e) {
     /* suggestions are optional */
   }
+}
+
+// --------------------------------------------------------------------------- //
+// Prose metadata editor (shared component)
+//
+// A free-form editor over the RAW prose document: one textarea for the database,
+// one per real table, plus relationships and examples. Rendered here for the
+// Excel review modal; B1 mounts the same component in the sidebar. It binds to
+// `doc.prose` and reads back a `{database, tables, relationships, examples}`
+// object — never the reconciled projection.
+// --------------------------------------------------------------------------- //
+
+const PROSE_FIELDS = {
+  database: "What this data is; conventions, units, rules the model should know…",
+  relationships: "How the tables join, in plain words…",
+  examples: "Example questions worth teaching the model…",
+};
+
+function addProseField(container, key, labelText, value, placeholder) {
+  const node = els.proseFieldTemplate.content.firstElementChild.cloneNode(true);
+  node.querySelector(".prose-label").textContent = labelText;
+  const textarea = node.querySelector(".prose-input");
+  textarea.value = value || "";
+  textarea.placeholder = placeholder || "";
+  textarea.dataset.key = key;
+  container.appendChild(node);
+}
+
+/** Fill `container` with prose fields seeded from `doc` (its `prose` + `tables`). */
+function renderProseEditor(container, doc) {
+  container.innerHTML = "";
+  const prose = doc.prose || {};
+  const tables = prose.tables || {};
+
+  addProseField(container, "database", "Database", prose.database, PROSE_FIELDS.database);
+  for (const table of doc.tables || []) {
+    addProseField(
+      container,
+      "tables:" + table,
+      "Table: " + table,
+      tables[table],
+      "What a row is; column meanings; code lookups (e.g. FPO = Faster Payment Out)…",
+    );
+  }
+  addProseField(container, "relationships", "Relationships", prose.relationships, PROSE_FIELDS.relationships);
+  addProseField(container, "examples", "Examples", prose.examples, PROSE_FIELDS.examples);
+}
+
+/** Read every textarea in `container` back into a prose object. */
+function collectProse(container) {
+  const prose = { database: "", tables: {}, relationships: "", examples: "" };
+  container.querySelectorAll(".prose-input").forEach((textarea) => {
+    const key = textarea.dataset.key;
+    if (key.startsWith("tables:")) {
+      prose.tables[key.slice("tables:".length)] = textarea.value;
+    } else {
+      prose[key] = textarea.value;
+    }
+  });
+  return prose;
+}
+
+/** Render a "N kept / M dropped" line plus any reconcile warnings into `el`. */
+function renderReconSummary(el, summary) {
+  if (!summary) { el.innerHTML = ""; return; }
+  if (summary.message) {
+    el.innerHTML = `<div class="recon-counts">${escapeHtml(summary.message)}</div>`;
+    return;
+  }
+
+  const parts = [`<span class="recon-ok">${summary.matched} item(s) kept</span>`];
+  if (summary.dropped) {
+    parts.push(`<span class="recon-drop">${summary.dropped} dropped</span>`);
+  }
+  let html = `<div class="recon-counts">${parts.join(" · ")}</div>`;
+  if (summary.warnings && summary.warnings.length) {
+    html +=
+      '<ul class="recon-warnings">' +
+      summary.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join("") +
+      "</ul>";
+  }
+  el.innerHTML = html;
+}
+
+// --------------------------------------------------------------------------- //
+// Excel metadata review modal
+// --------------------------------------------------------------------------- //
+
+/** Offer to convert a workbook's documentation sheet into a sidecar. */
+async function maybeShowMetadataReview(config) {
+  if (!config || !config.metadata_suggestion) return;
+
+  let doc;
+  try {
+    doc = await (await fetch("/api/metadata")).json();
+  } catch (e) {
+    return; // an offer we can't render is silently dropped, not fatal
+  }
+  if (doc.error || !doc.pending) return;
+
+  els.mrSheets.textContent = (doc.pending.sheets || []).join(", ");
+  renderProseEditor(els.mrEditor, doc);
+  renderReconSummary(els.mrRecon, null);
+  show(els.metaReview);
+}
+
+/** Dry-run reconcile: POST /preview and show the kept/dropped summary. */
+async function previewProse(editorEl, reconEl, btn) {
+  const prose = collectProse(editorEl);
+  btn.disabled = true;
+  renderReconSummary(reconEl, { message: "Generating & reconciling…" });
+  try {
+    const data = await postJSON("/api/metadata/preview", { prose });
+    renderReconSummary(reconEl, data.error ? { message: data.error } : data);
+  } catch (e) {
+    renderReconSummary(reconEl, { message: "Preview failed: " + e.message });
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** Commit: POST the prose, returning the response (or null on failure). */
+async function saveProse(editorEl, reconEl, btn) {
+  const prose = collectProse(editorEl);
+  btn.disabled = true;
+  renderReconSummary(reconEl, { message: "Saving…" });
+  try {
+    const data = await postJSON("/api/metadata", { prose });
+    if (data.error) {
+      renderReconSummary(reconEl, { message: data.error });
+      return null;
+    }
+    renderReconSummary(reconEl, data);
+    return data;
+  } catch (e) {
+    renderReconSummary(reconEl, { message: "Save failed: " + e.message });
+    return null;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function saveMetadataReview() {
+  const data = await saveProse(els.mrEditor, els.mrRecon, els.mrSave);
+  if (!data) return;
+  hide(els.metaReview);
+  // The sidecar now feeds the schema view and the sidebar editor.
+  await loadSchema();
+  applyConfig(await (await fetch("/api/config")).json());
+  loadMetadata();
+}
+
+async function discardMetadataReview() {
+  try {
+    await fetch("/api/metadata/pending", { method: "DELETE" });
+  } catch (e) {
+    /* discarding is best-effort */
+  }
+  hide(els.metaReview);
+  applyConfig(await (await fetch("/api/config")).json());
+  loadMetadata();
+}
+
+// --------------------------------------------------------------------------- //
+// Persistent sidebar metadata editor
+//
+// Always available once a file is loaded. Shares the prose-editor component and
+// the preview/save helpers with the Excel review modal.
+// --------------------------------------------------------------------------- //
+
+/** Fetch the RAW metadata document and (re)render the sidebar editor. */
+async function loadMetadata() {
+  if (!state.ready) { hide(els.metaEditor); return; }
+
+  let doc;
+  try {
+    doc = await (await fetch("/api/metadata")).json();
+  } catch (e) {
+    hide(els.metaEditor);
+    return;
+  }
+  if (doc.error) { hide(els.metaEditor); return; }
+
+  renderProseEditor(els.metaProse, doc);
+
+  // A short line on the file's state: whether a sidecar exists and, if its
+  // prose was edited since the blocks were generated, that a Save is due.
+  let hint = doc.exists ? "Editing the sidecar next to this file." : "No metadata file yet — add notes and Save to create one.";
+  if (doc.stale) hint += " Prose changed since last generate; Save to refresh.";
+  els.metaHint.textContent = hint;
+
+  renderReconSummary(els.metaRecon, doc.reconcile);
+  show(els.metaEditor);
+}
+
+async function saveMetadataSidebar() {
+  const data = await saveProse(els.metaProse, els.metaRecon, els.metaSaveBtn);
+  if (!data) return;
+  // A saved sidecar changes the schema view (descriptions, codes) too.
+  await loadSchema();
+  applyConfig(await (await fetch("/api/config")).json());
 }
 
 // --------------------------------------------------------------------------- //
@@ -532,6 +754,21 @@ els.fileInput.addEventListener("change", () => {
   const file = els.fileInput.files && els.fileInput.files[0];
   if (file) uploadFile(file);
 });
+
+els.mrPreview.addEventListener("click", () =>
+  previewProse(els.mrEditor, els.mrRecon, els.mrPreview),
+);
+els.mrSave.addEventListener("click", saveMetadataReview);
+els.mrDiscard.addEventListener("click", discardMetadataReview);
+
+els.metaToggle.addEventListener("click", () => {
+  const collapsed = els.metaBody.classList.toggle("hidden");
+  els.metaToggle.querySelector(".caret").textContent = collapsed ? "▸" : "▾";
+});
+els.metaPreviewBtn.addEventListener("click", () =>
+  previewProse(els.metaProse, els.metaRecon, els.metaPreviewBtn),
+);
+els.metaSaveBtn.addEventListener("click", saveMetadataSidebar);
 
 setReady(false);
 loadConfig();

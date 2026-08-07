@@ -23,6 +23,26 @@ examples fresh per question; see `context.relevant_tables`, `context.
 select_examples`, `SQLBrowserSession._query_context`, and `web.py`'s
 `run_query`.
 
+Phase 3 delivered (prose-canonical metadata): a single authoring pipeline —
+*free-form prose → per-section LLM parse → reconcile against the live schema →
+structured YAML* — fed by two front doors. Prose is now the canonical artifact,
+embedded as a `prose:` block in the sidecar; the structured blocks are a
+generated, reconciled artifact stamped with a `_generated.from_prose_digest` so
+staleness is detected at load without ever calling the model. Delivered pieces:
+Excel documentation-sheet detection and split (`excel_loader.plan_sheets`,
+`convert_with_metadata_detection`, `convert_xlsx_to_sqlite(skip_sheets=…)`) so a
+workbook whose metadata sheet has blank rows no longer fails the whole load;
+comment-preserving round-trip writes via `ruamel.yaml` (`metadata.write_document`,
+`load_prose`, `prose_digest`, `regenerate_structured`); all new prompt text in
+`context.py` (`build_prose_parse_prompt`, `build_metadata_sheet_classifier_prompt`,
+`schema_hint_for_*`); `llm.parse_prose_to_metadata` / `classify_sheet`; a
+web editor (persistent sidebar editor plus an Excel-review modal that offers to
+convert an in-workbook documentation sheet) backed by `GET/POST /api/metadata`,
+`POST /api/metadata/preview`, and `DELETE /api/metadata/pending`; and CLI parity
+via `--regenerate-metadata`. Reconciliation stays the single gate, so the
+additive-never-authoritative guarantee is unchanged and legacy structured-only
+sidecars load identically.
+
 ---
 
 ## P1 — do these next
@@ -77,7 +97,9 @@ reconciliation warnings and exits non-zero would make it usable in CI, so a
 schema migration that invalidates documentation fails a build rather than
 silently degrading prompts months later.
 
-Cheap: `resolve_metadata()` already returns exactly the warning list needed.
+Cheap: `resolve_metadata()` already returns exactly the warning list needed, and
+Phase 3 added the sibling mode flags `--init-metadata` / `--regenerate-metadata`
+to copy the shape from — this is now a small addition.
 
 ### 4. Mitigating wrong-but-valid value codes
 
@@ -120,12 +142,18 @@ The loader is deliberately source-agnostic, so these are drop-ins:
 
 - **Embedded `_sql_browser_metadata` table**, mirroring the profiler's sidecar
   cache pattern. Travels with the `.db` file; harder to hand-edit.
-- **`__metadata__` sheet in an Excel workbook**, so metadata lives in the same
-  file the analyst already owns and emails around.
+- ~~**`__metadata__` sheet in an Excel workbook**~~ — ✅ **Delivered (Phase 3).**
+  A workbook's documentation sheet is detected (name heuristic, with an optional
+  LLM classifier fallback), split off from the data sheets, and its text
+  extracted as prose the review modal offers to convert into a sidecar. The
+  extracted prose still writes to the `<stem>.meta.yaml` sidecar rather than back
+  into the workbook, so it survives a copy only if the sidecar travels with it —
+  writing metadata *into* the `.xlsx` remains open.
 
 Excel is where this matters most — a workbook declares no foreign keys, so
-`relationships:` is the only way its sheets can be connected, and keeping that
-inside the workbook means it survives being copied.
+`relationships:` is the only way its sheets can be connected. With the sheet now
+ingested as prose, documenting those joins in the workbook and having them
+reconciled into the sidecar is the natural next step.
 
 ### 6. `pii` → result masking
 
@@ -135,22 +163,26 @@ belongs (`query_executor.py` for the CLI, the `/api/query` payload for the web
 UI) and an obvious escape hatch — a flag or a per-query override — since the
 whole point of a browser is sometimes to look at the data.
 
-### 7. Web UI metadata editing
+### 7. Web UI metadata editing — ✅ Delivered (Phase 3)
 
-The schema panel now shows descriptions and warnings read-only. Editing them in
-the browser and writing back to the YAML would close the loop for non-terminal
-users. Meaningful work: needs a write endpoint, comment-preserving YAML
-round-tripping (a real `ruamel.yaml` dependency — the current hand-rolled writer
-only generates, it can't edit), and conflict handling if the file changed on disk.
+Shipped as the prose-canonical editor: a collapsible sidebar editor bound to the
+RAW document (prose + pre-reconcile structured), Preview (dry-run reconcile) and
+Save, plus the Excel-review modal. The write endpoint, `ruamel.yaml`
+round-tripping and staleness detection all landed. Still open: on-disk conflict
+handling if the sidecar is edited by hand *while* the web session holds it — Save
+currently rewrites from the session's view without checking for a newer file.
 
 ### 8. Test coverage for the web wiring
 
-`metadata.py`, `context.py` and the CLI's metadata wiring are covered.
-`tests/test_web.py` now covers the `/api/query` pruning/example wiring added in
-Phase 2 (see `fastapi.testclient` against `create_app()`, following the
-Ollama-stubbing pattern in `tests/test_cli.py`). Still uncovered by a test:
-`BrowserSession.load_file()` and the `/api/schema` payload - both verified by
-hand only.
+`metadata.py`, `context.py`, `excel_loader.py` and the CLI's metadata wiring
+(including `--regenerate-metadata`) are covered. `tests/test_web.py` now covers
+the `/api/query` pruning/example wiring (Phase 2) and the Phase 3 metadata
+endpoints: the raw-vs-reconciled binding (`GET /api/metadata` vs `/api/schema`),
+preview-writes-nothing, Save-writes-and-reloads, graceful degradation when Ollama
+is down, and Excel workbook load offering metadata while loading only the data
+sheet — which exercises `load_file()` for the Excel path. Still uncovered by a
+test: the frontend itself (the modal-visibility CSS regression that shipped in A7
+and was fixed by hand is exactly the kind of thing no Python test would catch).
 
 ### 9. `default_time_column` is prompt-only
 
@@ -166,7 +198,8 @@ as the value corrector.
   metadata is additive only, so a stale file can never make the tool assert
   something false about the data. Every consumer depends on that guarantee.
   Anything needing an override is really asking for a fix to the data or a view.
-- **A YAML round-tripping dependency for scaffolding.** The generator emits text
-  directly so it can include explanatory comments, which `yaml.safe_dump` strips.
-  Only revisit this alongside #7 (web UI metadata editing), which genuinely needs
-  editing rather than generation.
+- ~~**A YAML round-tripping dependency for scaffolding.**~~ Revisited and adopted
+  in Phase 3, exactly as flagged: editing (not just generation) needed it, so
+  `ruamel.yaml` now backs `metadata.write_document` for comment-preserving
+  round-trip writes. The hand-rolled writer (`build_scaffold`) is still used for
+  `--init-metadata`, where there is nothing to preserve.

@@ -233,6 +233,93 @@ section { margin-top: 20px; }
 .results-table tr:hover td { background: var(--panel); }
 .results-table .null { color: var(--muted); font-style: italic; }
 
+/* --- Persistent sidebar metadata editor --- */
+#metadata-editor { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 16px; }
+#metadata-editor h2.collapsible { cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+#metadata-editor h2.collapsible .caret { color: var(--muted); font-size: 11px; }
+#metadata-editor .editor-hint { font-size: 11px; color: var(--muted); line-height: 1.4; margin: 0 0 12px; }
+#metadata-editor .prose-input { font-size: 11.5px; }
+#metadata-editor #metadata-recon { margin-top: 12px; }
+.editor-actions { display: flex; gap: 8px; margin-top: 12px; }
+.editor-actions button { padding: 7px 12px; font-size: 12px; flex: 1; }
+.editor-actions button.secondary { background: var(--panel-2); border: 1px solid var(--border); }
+.editor-actions button.secondary:hover { background: var(--border); }
+
+/* --- Prose metadata editor (Excel review modal + sidebar) --- */
+.prose-editor { display: flex; flex-direction: column; gap: 14px; }
+.prose-field { display: flex; flex-direction: column; gap: 5px; }
+.prose-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  font-family: var(--mono);
+}
+.prose-input {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  resize: vertical;
+}
+.prose-input:focus { outline: none; border-color: var(--accent-dim); }
+
+.recon-summary { font-size: 12.5px; }
+.recon-summary:empty { display: none; }
+.recon-counts { color: var(--muted); }
+.recon-ok { color: var(--accent); }
+.recon-drop { color: var(--warn); }
+.recon-warnings {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--warn);
+}
+.recon-warnings li { margin: 2px 0; }
+
+/* --- Modal overlay (metadata review) --- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+}
+/* `.modal-overlay`'s `display: flex` would otherwise beat the equal-specificity
+   `.hidden { display: none }` on source order, leaving the modal always shown. */
+.modal-overlay.hidden { display: none; }
+.modal {
+  width: 100%;
+  max-width: 720px;
+  max-height: 88vh;
+  overflow-y: auto;
+  padding: 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.modal h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  color: var(--accent);
+  text-transform: none;
+  letter-spacing: normal;
+}
+.modal-intro { margin: 0 0 18px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.modal-intro #mr-sheets { color: var(--text); font-family: var(--mono); }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
 .spinner {
   display: inline-block;
   width: 13px; height: 13px;

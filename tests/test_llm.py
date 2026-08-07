@@ -84,4 +84,72 @@ def test_no_examples_means_no_extra_turns(monkeypatch):
     assert len(captured["messages"]) == 2
     assert captured["messages"][1] == {"role": "user", "content": "hi"}
 
+
+# --------------------------------------------------------------------------- #
+# parse_prose_to_metadata: the single LLM step behind regenerate_structured
+# --------------------------------------------------------------------------- #
+
+def _stub_prose_chat(monkeypatch, content):
+    """Replace ollama.chat for the prose parser and capture its arguments."""
+    captured = {}
+
+    def fake_chat(model, messages, format):
+        captured["messages"] = messages
+        captured["format"] = format
+        return {"message": {"content": content}}
+
+    monkeypatch.setattr("sql_browser.llm.ollama.chat", fake_chat)
+    return captured
+
+
+def test_parse_prose_requests_json_and_sources_prompt_from_context(monkeypatch):
+    captured = _stub_prose_chat(monkeypatch, json.dumps({"description": "orders"}))
+    translator = LLMQueryTranslator()
+
+    result = translator.parse_prose_to_metadata(
+        "table", "status is a code", "Table: orders", table="orders"
+    )
+
+    assert result == {"description": "orders"}
+    assert captured["format"] == "json"
+    # The prompt is the one context builds: it carries the prose and the hint.
+    prompt = captured["messages"][0]["content"]
+    assert "status is a code" in prompt
+    assert "Table: orders" in prompt
+
+
+def test_parse_prose_repairs_malformed_json(monkeypatch):
+    # Trailing comma - invalid JSON that json_repair can fix.
+    _stub_prose_chat(monkeypatch, '{"description": "orders",}')
+    translator = LLMQueryTranslator()
+
+    result = translator.parse_prose_to_metadata("table", "notes", "hint", table="orders")
+
+    assert result == {"description": "orders"}
+
+
+def test_parse_prose_returns_empty_dict_on_failure(monkeypatch):
+    def boom(model, messages, format):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr("sql_browser.llm.ollama.chat", boom)
+    translator = LLMQueryTranslator()
+
+    # A failed call must degrade to {} (regenerate turns that into a warning).
+    assert translator.parse_prose_to_metadata("database", "notes", "hint") == {}
+
+
+def test_classify_sheet_returns_only_known_verdicts(monkeypatch):
+    _stub_prose_chat(monkeypatch, json.dumps({"kind": "metadata"}))
+    translator = LLMQueryTranslator()
+
+    assert translator.classify_sheet("Notes", "BGC | Bank Giro Credit") == "metadata"
+
+
+def test_classify_sheet_rejects_an_unusable_verdict(monkeypatch):
+    _stub_prose_chat(monkeypatch, json.dumps({"kind": "maybe"}))
+    translator = LLMQueryTranslator()
+
+    assert translator.classify_sheet("Notes", "sample") is None
+
 # Made with Bob

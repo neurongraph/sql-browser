@@ -620,4 +620,207 @@ def test_scaffold_includes_every_table_and_column(inspector):
     for token in ("customers:", "orders:", "customer_id:", "total_cents:", "region:"):
         assert token in text
 
+
+# --------------------------------------------------------------------------- #
+# Prose model, digest, and staleness
+# --------------------------------------------------------------------------- #
+
+def test_prose_treats_blank_sections_as_absent():
+    """A whitespace-only section must not count as prose, or files look stale."""
+    prose = md.Prose.model_validate(
+        {"database": "   \n", "tables": {"orders": ""}, "relationships": "  x  "}
+    )
+
+    assert prose.database is None
+    assert prose.tables == {}
+    assert prose.relationships == "x"
+    assert prose.is_empty is False  # relationships survived
+
+
+def test_empty_prose_is_empty():
+    assert md.Prose().is_empty is True
+
+
+def test_prose_digest_is_stable_across_equivalent_input():
+    """`""`/trailing-newline and omission must hash the same (stable staleness)."""
+    a = md.Prose.model_validate({"database": "Bank data.", "examples": ""})
+    b = md.Prose.model_validate({"database": "Bank data.\n"})
+
+    assert md.prose_digest(a) == md.prose_digest(b)
+
+
+def test_prose_digest_changes_when_prose_changes():
+    a = md.Prose(database="Bank data.")
+    b = md.Prose(database="Bank data. Amounts in GBP.")
+
+    assert md.prose_digest(a) != md.prose_digest(b)
+
+
+def test_load_prose_from_a_legacy_file_is_empty(tmp_path):
+    """A structured-only sidecar has no `prose:` key; loading it must not raise."""
+    path = write(
+        tmp_path / "legacy.meta.yaml",
+        "version: 1\ntables:\n  orders:\n    description: orders\n",
+    )
+
+    assert md.load_prose(path).is_empty
+
+
+def test_load_prose_reads_an_embedded_block(tmp_path):
+    path = write(
+        tmp_path / "p.meta.yaml",
+        "version: 1\nprose:\n  database: |\n    Bank data.\n",
+    )
+
+    assert md.load_prose(path).database == "Bank data."
+
+
+# --------------------------------------------------------------------------- #
+# Backward compatibility: a legacy file loads and reconciles identically
+# --------------------------------------------------------------------------- #
+
+LEGACY_SIDECAR = """\
+version: 1
+tables:
+  orders:
+    description: One row per order.
+    columns:
+      status:
+        values:
+          P: {label: Pending}
+          S: {label: Shipped}
+"""
+
+
+def test_legacy_sidecar_loads_identically(inspector, tmp_path):
+    """Adding prose support must not change how an existing file reconciles."""
+    path = write(tmp_path / "legacy.meta.yaml", LEGACY_SIDECAR)
+
+    reconciled, warnings = md.reconcile(md.load(path), inspector)
+
+    assert reconciled.table("orders").description == "One row per order."
+    assert set(reconciled.column("orders", "status").values) == {"P", "S"}
+    assert warnings == []
+
+
+# --------------------------------------------------------------------------- #
+# regenerate_structured: RAW output, per-unit failure, section preservation
+# --------------------------------------------------------------------------- #
+
+class StubLLM:
+    """A parse_prose_to_metadata that returns canned stanzas keyed by section."""
+
+    def __init__(self, responses, fail_sections=()):
+        self.responses = responses
+        self.fail_sections = set(fail_sections)
+        self.calls = []
+
+    def parse_prose_to_metadata(self, section, prose_text, schema_hint, table=None):
+        key = table if section == "table" else section
+        self.calls.append(key)
+        if key in self.fail_sections:
+            raise RuntimeError("model down")
+        return self.responses.get(key, {})
+
+
+def test_regenerate_returns_raw_unreconciled_metadata(inspector):
+    """The LLM only proposes; regenerate must NOT drop an invented code itself."""
+    llm = StubLLM(
+        {
+            "orders": {
+                "description": "orders",
+                "columns": {
+                    "status": {"values": {"P": {"label": "Pending"}, "ZZZ": {"label": "Bogus"}}}
+                },
+            }
+        }
+    )
+    prose = md.Prose(tables={"orders": "status is a code"})
+
+    raw, warnings = md.regenerate_structured(prose, llm, inspector)
+
+    # RAW keeps the invented code; reconcile is the gate, applied separately.
+    assert "ZZZ" in raw.column("orders", "status").values
+    reconciled, recon_warnings = md.reconcile(raw, inspector)
+    assert "ZZZ" not in reconciled.column("orders", "status").values
+    assert any("'ZZZ'" in w for w in recon_warnings)
+
+
+def test_regenerate_empty_response_warns_and_leaves_the_stanza_empty(inspector):
+    llm = StubLLM({})  # every section returns {}
+    prose = md.Prose(database="Some notes.")
+
+    raw, warnings = md.regenerate_structured(prose, llm, inspector)
+
+    assert raw.database.description is None
+    assert any("database" in w and "nothing usable" in w for w in warnings)
+
+
+def test_regenerate_model_failure_costs_one_stanza(inspector):
+    llm = StubLLM(
+        {"orders": {"description": "orders"}}, fail_sections={"database"}
+    )
+    prose = md.Prose(database="db notes", tables={"orders": "table notes"})
+
+    raw, warnings = md.regenerate_structured(prose, llm, inspector)
+
+    # The failed database call is warned about, but the table still came through.
+    assert any("database" in w and "failed" in w for w in warnings)
+    assert raw.table("orders").description == "orders"
+
+
+def test_regenerate_preserves_a_section_with_no_prose(inspector):
+    """A blank prose section copies the existing structured block untouched."""
+    existing = md.Metadata.model_validate(
+        {"tables": {"orders": {"description": "hand-authored", "grain": "order"}}}
+    )
+    llm = StubLLM({})
+    prose = md.Prose(database="only the database has prose")
+
+    raw, _ = md.regenerate_structured(prose, llm, inspector, existing=existing)
+
+    # 'orders' had no prose, so its hand-authored block survives verbatim.
+    assert raw.table("orders").description == "hand-authored"
+    assert raw.table("orders").grain == "order"
+    # And the database section was (attempted to be) regenerated.
+    assert "database" in llm.calls
+    assert "orders" not in llm.calls
+
+
+# --------------------------------------------------------------------------- #
+# write_document: round-trip preservation
+# --------------------------------------------------------------------------- #
+
+def test_write_document_creates_prose_and_generated_blocks(inspector, tmp_path):
+    path = tmp_path / "new.meta.yaml"
+    prose = md.Prose(tables={"orders": "status: P=Pending, S=Shipped"})
+    raw = md.Metadata.model_validate(
+        {"tables": {"orders": {"columns": {"status": {"values": {"P": {"label": "Pending"}}}}}}}
+    )
+
+    md.write_document(path, prose, raw, source_name="shop.db", model="test-model")
+
+    text = path.read_text(encoding="utf-8")
+    assert "PROSE IS CANONICAL" in text  # header comment on a fresh file
+    assert "prose:" in text
+    assert "from_prose_digest:" in text
+    assert "test-model" in text
+    # Reloading yields the same prose that was written.
+    assert md.load_prose(path).tables["orders"].startswith("status:")
+
+
+def test_write_document_leaves_a_prose_less_section_untouched(inspector, tmp_path):
+    """Saving with empty prose must not wipe a hand-authored structured block."""
+    path = write(tmp_path / "legacy.meta.yaml", LEGACY_SIDECAR)
+
+    # Prose only mentions the database; 'orders' has no prose.
+    prose = md.Prose(database="A note about the shop.")
+    raw = md.regenerate_structured(prose, StubLLM({}), inspector, existing=md.load(path))[0]
+    md.write_document(path, prose, raw, source_name="shop.db")
+
+    # The hand-authored orders block is still on disk and still reconciles.
+    reloaded, warnings = md.reconcile(md.load(path), inspector)
+    assert reloaded.table("orders").description == "One row per order."
+    assert set(reloaded.column("orders", "status").values) == {"P", "S"}
+
 # Made with Bob

@@ -90,6 +90,81 @@ def test_init_metadata_refuses_to_overwrite(db_path):
 
 
 # --------------------------------------------------------------------------- #
+# regenerate-metadata (the CLI twin of the web editor's Save)
+# --------------------------------------------------------------------------- #
+
+def _stub_parse(monkeypatch, response):
+    """Stub parse_prose_to_metadata so no live model is needed."""
+    def fake(self, section, prose_text, schema_hint, table=None):
+        return response
+
+    monkeypatch.setattr(
+        "sql_browser.llm.LLMQueryTranslator.parse_prose_to_metadata", fake
+    )
+
+
+def test_regenerate_metadata_rebuilds_structured_from_prose(db_path, monkeypatch):
+    """A prose edit becomes real structured metadata, reconciled against the data."""
+    # A stanza with one valid code (P, in the data) and one invented (Z).
+    _stub_parse(
+        monkeypatch,
+        {
+            "description": "orders",
+            "columns": {
+                "status": {"values": {"P": {"label": "Pending"}, "Z": {"label": "Nope"}}}
+            },
+        },
+    )
+    sidecar = db_path.with_name("shop.meta.yaml")
+    sidecar.write_text(
+        "version: 1\n"
+        "prose:\n"
+        "  tables:\n"
+        "    orders:\n"
+        "      P means Pending.\n"
+    )
+
+    result = runner.invoke(app, ["--regenerate-metadata", str(db_path)])
+
+    assert result.exit_code == 0
+    on_disk = sidecar.read_text()
+    # RAW structured is written (reconcile is a read-time gate): the generated
+    # label lands on disk, and provenance ties it back to the prose.
+    assert "from_prose_digest:" in on_disk
+    assert "Pending" in on_disk
+    # The reconcile report tells the user the invented code was dropped.
+    assert "1 dropped" in result.output
+
+
+def test_regenerate_metadata_refuses_without_a_sidecar(db_path):
+    result = runner.invoke(app, ["--regenerate-metadata", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "no metadata file" in result.output
+
+
+def test_regenerate_metadata_refuses_when_prose_is_empty(db_path):
+    """A legacy structured-only file has nothing to regenerate from."""
+    sidecar = db_path.with_name("shop.meta.yaml")
+    sidecar.write_text('version: 1\ndatabase:\n  description: "hand-authored"\n')
+
+    result = runner.invoke(app, ["--regenerate-metadata", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "no `prose:` block" in result.output
+    assert "hand-authored" in sidecar.read_text()  # untouched
+
+
+def test_init_and_regenerate_are_mutually_exclusive(db_path):
+    result = runner.invoke(
+        app, ["--init-metadata", "--regenerate-metadata", str(db_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "one or the other" in result.output
+
+
+# --------------------------------------------------------------------------- #
 # Mid-session reload
 # --------------------------------------------------------------------------- #
 

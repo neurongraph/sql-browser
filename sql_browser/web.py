@@ -34,10 +34,23 @@ from pydantic import BaseModel
 from .config import DEFAULT_MODEL, SQLITE_EXTENSIONS, settings
 from .context import select_examples
 from .database import DatabaseInspector
-from .excel_loader import EXCEL_EXTENSIONS, convert_xlsx_to_sqlite
+from .excel_loader import EXCEL_EXTENSIONS, convert_with_metadata_detection
 from .llm import LLMQueryTranslator, list_models
 from .logger import get_logger
-from .metadata import resolve_metadata
+from .metadata import (
+    Metadata,
+    MetadataError,
+    Prose,
+    discover,
+    load,
+    load_generated_digest,
+    load_prose,
+    prose_digest,
+    reconcile,
+    regenerate_structured,
+    resolve_metadata,
+    write_document,
+)
 from .profiler import profile_database
 from .query_corrector import apply_value_choices, find_value_mismatches
 from .sql_guard import (
@@ -88,9 +101,54 @@ class SessionRequest(BaseModel):
     force: bool = False
 
 
+class ProsePayload(BaseModel):
+    """The editable prose sections, as the frontend submits them."""
+
+    database: Optional[str] = None
+    tables: Dict[str, str] = {}
+    relationships: Optional[str] = None
+    examples: Optional[str] = None
+
+    def to_prose(self) -> Prose:
+        """Validate/normalize into the canonical metadata.Prose model."""
+        return Prose.model_validate(self.model_dump())
+
+
+class MetadataRequest(BaseModel):
+    """A prose document to preview or save."""
+
+    prose: ProsePayload = ProsePayload()
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+def _count_items(metadata: Metadata) -> int:
+    """Count the leaf facts in a metadata document.
+
+    Used to report how much of an authored/generated document survived
+    reconciliation. Relationships and examples are included; the number is a
+    coarse "kept items" figure for the editor, with the warnings list carrying
+    the specifics.
+    """
+    total = len(metadata.tables) + len(metadata.relationships) + len(metadata.examples)
+    for table_meta in metadata.tables.values():
+        total += len(table_meta.columns)
+        for column_meta in table_meta.columns.values():
+            total += len(column_meta.values)
+    return total
+
+
+def _prose_payload(prose: Prose) -> Dict[str, Any]:
+    """Render a Prose as JSON with empty strings, friendlier for textareas."""
+    return {
+        "database": prose.database or "",
+        "tables": dict(prose.tables),
+        "relationships": prose.relationships or "",
+        "examples": prose.examples or "",
+    }
+
 
 def _rows_to_json(column_names: List[str], rows: List[Any]) -> List[List[Any]]:
     """Convert result rows to JSON-safe lists of values."""
@@ -148,6 +206,10 @@ class BrowserSession:
         #: A path given on the command line. Trusted, and loadable even though
         #: it lives outside the data directory.
         self.pinned_path: Optional[Path] = None
+        #: An offer to seed metadata from an Excel workbook's own documentation
+        #: sheet, set only when such a sheet was detected and no sidecar already
+        #: exists. Shape: {"prose": Prose, "sheets": [titles]}. None otherwise.
+        self.pending_metadata: Optional[Dict[str, Any]] = None
 
     # -- state ------------------------------------------------------------- #
 
@@ -182,9 +244,17 @@ class BrowserSession:
         """
         with self.lock:
             temp_db_path: Optional[Path] = None
+            excel_warnings: List[str] = []
+            excel_metadata_text: Dict[str, str] = {}
             if path.suffix.lower() in EXCEL_EXTENSIONS:
                 logger.info(f"Converting Excel workbook to temporary SQLite database: {path}")
-                temp_db_path = convert_xlsx_to_sqlite(path)
+                # Split off any sheet that is documentation rather than data, so
+                # its irregular layout can't fail the whole workbook and its text
+                # can seed the metadata prose. Classification degrades to "data"
+                # when Ollama is unreachable.
+                temp_db_path, excel_warnings, excel_metadata_text = (
+                    convert_with_metadata_detection(path, classify=self.llm.classify_sheet)
+                )
                 resolved = temp_db_path
             else:
                 resolved = path
@@ -211,12 +281,18 @@ class BrowserSession:
                     override=override,
                     use_file=self.use_metadata,
                 )
+                inspector.metadata_warnings = list(inspector.metadata_warnings) + excel_warnings
 
                 schema_info = inspector.get_schema_description()
             except Exception:
                 if temp_db_path:
                     temp_db_path.unlink(missing_ok=True)
                 raise
+
+            # Offer to convert an in-workbook documentation sheet into metadata,
+            # but only when there's no sidecar already: an existing file is
+            # authoritative and must never be silently overwritten.
+            pending = self._build_pending_metadata(path, inspector, excel_metadata_text)
 
             # Only now let go of the previous database.
             self._release_database()
@@ -225,9 +301,32 @@ class BrowserSession:
             self.source_path = path
             self._temp_db_path = temp_db_path
             self.schema_info = schema_info
+            self.pending_metadata = pending
             # Past turns described a different database; they'd mislead the LLM.
             self.conversation_history = []
             logger.info(f"Loaded {path} (model: {self.model})")
+
+    @staticmethod
+    def _build_pending_metadata(
+        source_path: Path,
+        inspector: DatabaseInspector,
+        metadata_text: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Turn detected documentation-sheet text into a pending prose offer.
+
+        Returns None (no offer) when there was no documentation sheet or a
+        sidecar already exists for this source.
+        """
+        if not metadata_text or discover(source_path) is not None:
+            return None
+
+        combined = "\n\n".join(metadata_text.values())
+        real_tables = inspector.get_tables()
+        if len(real_tables) == 1:
+            prose = Prose(tables={real_tables[0]: combined})
+        else:
+            prose = Prose(database=combined)
+        return {"prose": prose, "sheets": list(metadata_text.keys())}
 
     def set_model(self, model: str) -> None:
         """Point the translator at a different Ollama model.
@@ -247,6 +346,89 @@ class BrowserSession:
             self.inspector = None
             self.source_path = None
             self.schema_info = ""
+            self.pending_metadata = None
+
+    # -- metadata editing -------------------------------------------------- #
+
+    def sidecar_path(self) -> Optional[Path]:
+        """Where this source's metadata sidecar lives, existing or to-be-written.
+
+        An existing sidecar (however named) is reused; otherwise the canonical
+        ``<stem>.meta.yaml`` next to the source/workbook - never next to the
+        throwaway temp database.
+        """
+        if not self.source_path:
+            return None
+        existing = discover(self.source_path)
+        if existing is not None:
+            return existing
+        return self.source_path.with_name(f"{self.source_path.stem}.meta.yaml")
+
+    def _existing_structured(self) -> Metadata:
+        """Load the current structured blocks, for section preservation on Save."""
+        path = discover(self.source_path) if self.source_path else None
+        if path is None:
+            return Metadata()
+        try:
+            return load(path)
+        except MetadataError:
+            return Metadata()
+
+    def reload_metadata(self) -> List[str]:
+        """Re-resolve metadata and rebuild the schema text after a write."""
+        with self.lock:
+            override = (
+                self.metadata_path if self.source_path == self.pinned_path else None
+            )
+            self.inspector.metadata, self.inspector.metadata_warnings = resolve_metadata(
+                self.inspector,
+                source_path=self.source_path,
+                override=override,
+                use_file=self.use_metadata,
+            )
+            self.schema_info = self.inspector.get_schema_description()
+            return list(self.inspector.metadata_warnings)
+
+    def preview_metadata(self, prose: Prose) -> Dict[str, Any]:
+        """Dry-run: regenerate structured blocks and reconcile, writing nothing."""
+        with self.lock:
+            raw, gen_warnings = regenerate_structured(
+                prose, self.llm, self.inspector, existing=self._existing_structured()
+            )
+            reconciled, recon_warnings = reconcile(raw, self.inspector)
+        return {
+            "matched": _count_items(reconciled),
+            "dropped": len(recon_warnings),
+            "warnings": gen_warnings + recon_warnings,
+            "prose": _prose_payload(prose),
+        }
+
+    def save_metadata(self, prose: Prose) -> Dict[str, Any]:
+        """Regenerate, reconcile, write the sidecar, reload, and clear any offer.
+
+        Degrades rather than failing: if the model is unreachable the prose is
+        still written (with warnings), because prose is the canonical artifact.
+        """
+        with self.lock:
+            existing = self._existing_structured()
+            raw, gen_warnings = regenerate_structured(
+                prose, self.llm, self.inspector, existing=existing
+            )
+            reconciled, recon_warnings = reconcile(raw, self.inspector)
+            dest = self.sidecar_path()
+            write_document(
+                dest, prose, raw, source_name=self.source_path.name, model=self.model
+            )
+            self.reload_metadata()
+            self.pending_metadata = None
+        return {
+            "ok": True,
+            "path": str(dest),
+            "matched": _count_items(reconciled),
+            "dropped": len(recon_warnings),
+            "warnings": gen_warnings + recon_warnings,
+            "prose": _prose_payload(prose),
+        }
 
     def _release_database(self) -> None:
         """Disconnect the current inspector and delete its temp database."""
@@ -486,6 +668,9 @@ def create_app(
             "ready": session.ready,
             "data_dir": str(settings.resolved_data_dir()),
             "max_upload_mb": settings.max_upload_mb,
+            # A workbook whose documentation sheet can be turned into metadata.
+            "metadata_suggestion": session.pending_metadata is not None,
+            "metadata_editable": session.ready,
         }
 
     @app.get("/api/config")
@@ -605,6 +790,83 @@ def create_app(
             ],
             "metadata_warnings": metadata_warnings,
         }
+
+    # -- metadata editing --------------------------------------------------- #
+    #
+    # These bind to the RAW document (prose + pre-reconcile structured blocks),
+    # never the reconciled projection that /api/schema serves. Editing the
+    # reconciled view would silently drop mid-edit entries and write the
+    # auto-merged declared foreign keys back into the file. All four degrade to
+    # warnings rather than 500, so losing the LLM never breaks the editor.
+
+    @app.get("/api/metadata")
+    def get_metadata() -> Dict[str, Any]:
+        if not session.ready:
+            return {"error": NO_FILE_ERROR}
+        with session.lock:
+            inspector = session.inspector
+            real_tables = inspector.get_tables()
+            sidecar = discover(session.source_path)
+            exists = sidecar is not None
+            pending = session.pending_metadata
+
+            if pending is not None:
+                prose = pending["prose"]
+            elif exists:
+                prose = load_prose(sidecar)
+            else:
+                prose = Prose()
+
+            raw = load(sidecar) if exists else Metadata()
+            reconciled, recon_warnings = reconcile(raw, inspector)
+
+            file_prose = load_prose(sidecar) if exists else Prose()
+            stale = bool(
+                exists
+                and not file_prose.is_empty
+                and load_generated_digest(sidecar) != prose_digest(file_prose)
+            )
+
+        return {
+            "exists": exists,
+            "path": str(sidecar) if exists else None,
+            "prose": _prose_payload(prose),
+            "tables": real_tables,
+            "structured_present": not raw.is_empty,
+            "stale": stale,
+            "pending": {"sheets": pending["sheets"]} if pending else None,
+            "reconcile": {
+                "matched": _count_items(reconciled),
+                "dropped": len(recon_warnings),
+                "warnings": recon_warnings,
+            },
+        }
+
+    @app.post("/api/metadata/preview")
+    def preview_metadata(request: MetadataRequest) -> Dict[str, Any]:
+        if not session.ready:
+            return {"error": NO_FILE_ERROR}
+        try:
+            return session.preview_metadata(request.prose.to_prose())
+        except Exception as e:
+            logger.exception("Metadata preview failed")
+            return {"error": f"Preview failed: {e}"}
+
+    @app.post("/api/metadata")
+    def save_metadata(request: MetadataRequest) -> Dict[str, Any]:
+        if not session.ready:
+            return {"error": NO_FILE_ERROR}
+        try:
+            return session.save_metadata(request.prose.to_prose())
+        except Exception as e:
+            logger.exception("Metadata save failed")
+            return {"error": f"Save failed: {e}"}
+
+    @app.delete("/api/metadata/pending")
+    def discard_pending_metadata() -> Dict[str, Any]:
+        with session.lock:
+            session.pending_metadata = None
+        return {"ok": True}
 
     @app.get("/api/suggestions")
     def get_suggestions() -> Dict[str, Any]:

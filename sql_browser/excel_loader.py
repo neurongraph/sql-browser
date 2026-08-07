@@ -5,14 +5,30 @@ import re
 import sqlite3
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
+
+# A sheet named exactly this is always treated as documentation, never a table.
+EXPLICIT_METADATA_SHEET = "__metadata__"
+
+# Sheets whose name hints at documentation rather than data. Deliberately cheap
+# and LLM-free: the point is to catch the common "Description of Categories" /
+# "Glossary" / "Codes" sheets by name before spending a classifier call. Note
+# that a name match alone is not decisive — plan_sheets() also refuses to leave
+# a workbook with no data sheet, so a lone "descriptions" sheet stays data.
+_METADATA_NAME_RE = re.compile(r"meta|description|glossary|codes|lookup", re.IGNORECASE)
+
+# Signature of an optional classifier the caller may pass to resolve a
+# name-ambiguous, badly-laid-out sheet: (title, sample_text) -> verdict, where
+# verdict is "data", "metadata", or None ("don't know" — treated as data).
+SheetClassifier = Callable[[str, str], Optional[str]]
 
 
 class ExcelLoadError(Exception):
@@ -145,7 +161,130 @@ def _find_duplicate_headers(sheet_title: str, header: tuple) -> List[str]:
     return issues
 
 
-def convert_xlsx_to_sqlite(xlsx_path: Path) -> Path:
+def _open_workbook(xlsx_path: Path):
+    """Open a workbook read-only, translating failures into ExcelLoadError."""
+    try:
+        return openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    except (zipfile.BadZipFile, InvalidFileException, KeyError, OSError) as e:
+        raise ExcelLoadError(
+            [
+                f"Could not open '{xlsx_path.name}': {e}. Make sure the file is a "
+                "valid, non-corrupted .xlsx/.xlsm workbook and is not "
+                "password-protected."
+            ]
+        ) from e
+
+
+def _looks_like_metadata_sheet(title: str) -> bool:
+    """Cheap, LLM-free guess that a sheet is documentation rather than data."""
+    normalized = title.strip().lower()
+    if normalized == EXPLICIT_METADATA_SHEET:
+        return True
+    return _METADATA_NAME_RE.search(title) is not None
+
+
+def extract_sheet_text(all_rows: List[tuple]) -> str:
+    """Flatten a sheet's cells into free-form text for prose ingestion.
+
+    Non-blank cells in a row are joined left-to-right with ' | '; a fully blank
+    row becomes a paragraph break. This is the raw material an LLM later parses
+    into a prose metadata section, so it keeps the human's row/column grouping
+    rather than trying to impose a table structure on an irregular sheet.
+    """
+    lines: List[str] = []
+    prev_blank = True  # suppress leading blank lines
+    for row in all_rows:
+        cells = [str(cell).strip() for cell in row if not _is_blank_value(cell)]
+        if not cells:
+            if not prev_blank:
+                lines.append("")
+            prev_blank = True
+            continue
+        lines.append(" | ".join(cells))
+        prev_blank = False
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
+@dataclass
+class SheetPlan:
+    """How a single worksheet should be handled during conversion.
+
+    role is "data" (load as a table) or "metadata" (skip the table, harvest its
+    text). text is populated only for metadata sheets. reason is a short,
+    user-facing explanation of why the sheet was classified this way.
+    """
+
+    title: str
+    role: str
+    reason: str
+    text: Optional[str] = None
+
+
+def plan_sheets(
+    workbook, classify: Optional[SheetClassifier] = None
+) -> List[SheetPlan]:
+    """Decide, per sheet, whether it is data or documentation.
+
+    The name heuristic decides first. A sheet that is name-ambiguous *and* fails
+    the clean-table layout check may consult the optional `classify` callback
+    (typically an LLM); anything still uncertain stays "data" — a tidy
+    rectangular sheet is always data. As a final safety net, a workbook is never
+    left with zero data sheets: if every non-empty sheet looked like metadata,
+    they are all reverted to data.
+
+    Args:
+        workbook: An open openpyxl workbook.
+        classify: Optional (title, sample) -> "data"|"metadata"|None callback,
+            consulted only for the ambiguous-and-messy case.
+
+    Returns:
+        One SheetPlan per worksheet, in workbook order.
+    """
+    plans: List[SheetPlan] = []
+    for sheet in workbook.worksheets:
+        title = sheet.title
+        all_rows = list(sheet.iter_rows(values_only=True))
+        if not all_rows or all(_is_blank_row(row) for row in all_rows):
+            # Empty sheets never become tables anyway; label them data so they
+            # don't count against the "must have a data sheet" guard below.
+            plans.append(SheetPlan(title, "data", "empty sheet"))
+            continue
+
+        role, reason = "data", "clean table layout"
+        if _looks_like_metadata_sheet(title):
+            role, reason = "metadata", "sheet name looks like documentation"
+        else:
+            layout_issues, _, _ = _check_layout(title, all_rows)
+            if layout_issues and classify is not None:
+                try:
+                    verdict = classify(title, extract_sheet_text(all_rows)[:2000])
+                except Exception:
+                    verdict = None  # graceful degradation: unknown -> data
+                if verdict == "metadata":
+                    role, reason = "metadata", "classified as documentation"
+
+        text = extract_sheet_text(all_rows) if role == "metadata" else None
+        plans.append(SheetPlan(title, role, reason, text))
+
+    non_empty = [p for p in plans if p.reason != "empty sheet"]
+    if non_empty and all(p.role == "metadata" for p in non_empty):
+        # A workbook is data first. If detection swallowed every sheet, back off
+        # rather than convert to an empty database.
+        for plan in plans:
+            if plan.role == "metadata":
+                plan.role = "data"
+                plan.reason = "only sheet(s) available; loaded as data"
+                plan.text = None
+
+    return plans
+
+
+def convert_xlsx_to_sqlite(
+    xlsx_path: Path, skip_sheets: Optional[Set[str]] = None
+) -> Path:
     """Convert an Excel workbook into a temporary SQLite database.
 
     Each non-empty worksheet becomes a table named after the sheet, with the
@@ -153,6 +292,10 @@ def convert_xlsx_to_sqlite(xlsx_path: Path) -> Path:
 
     Args:
         xlsx_path: Path to the .xlsx/.xlsm file
+        skip_sheets: Sheet titles to leave out entirely (e.g. sheets detected as
+            documentation). Skipped before layout validation, so a metadata
+            sheet's irregular layout no longer fails the whole workbook. Default
+            None preserves the original every-sheet-is-a-table behavior.
 
     Returns:
         Path to the generated temporary SQLite database file
@@ -162,16 +305,8 @@ def convert_xlsx_to_sqlite(xlsx_path: Path) -> Path:
             (e.g. duplicate column headers, no usable data) that need to be
             fixed before it can be loaded. `.issues` lists every problem found.
     """
-    try:
-        workbook = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
-    except (zipfile.BadZipFile, InvalidFileException, KeyError, OSError) as e:
-        raise ExcelLoadError(
-            [
-                f"Could not open '{xlsx_path.name}': {e}. Make sure the file is a "
-                "valid, non-corrupted .xlsx/.xlsm workbook and is not "
-                "password-protected."
-            ]
-        ) from e
+    skip_sheets = skip_sheets or set()
+    workbook = _open_workbook(xlsx_path)
 
     fd, tmp_name = tempfile.mkstemp(suffix=".db", prefix="sql_browser_")
     os.close(fd)
@@ -183,6 +318,9 @@ def convert_xlsx_to_sqlite(xlsx_path: Path) -> Path:
 
     try:
         for sheet in workbook.worksheets:
+            if sheet.title in skip_sheets:
+                continue
+
             all_rows = list(sheet.iter_rows(values_only=True))
             if not all_rows or all(_is_blank_row(row) for row in all_rows):
                 continue
@@ -262,3 +400,49 @@ def convert_xlsx_to_sqlite(xlsx_path: Path) -> Path:
         )
 
     return db_path
+
+
+def convert_with_metadata_detection(
+    xlsx_path: Path, classify: Optional[SheetClassifier] = None
+) -> Tuple[Path, List[str], Dict[str, str]]:
+    """Convert a workbook, splitting off any sheets that look like documentation.
+
+    This is the metadata-aware front door to `convert_xlsx_to_sqlite`. Sheets
+    classified as documentation are skipped during conversion (so their
+    irregular layout can't fail the whole workbook) and their text is harvested
+    for later prose parsing. Genuine *data*-sheet problems still raise
+    `ExcelLoadError` exactly as before.
+
+    Args:
+        xlsx_path: Path to the .xlsx/.xlsm file
+        classify: Optional classifier for name-ambiguous, messy sheets; see
+            `plan_sheets`. When None, detection is name-heuristic only.
+
+    Returns:
+        A tuple of (db_path, warnings, metadata_text) where metadata_text maps
+        each detected documentation sheet's title to its extracted free-form
+        text, and warnings explains which sheets were treated as documentation.
+
+    Raises:
+        ExcelLoadError: If the workbook can't be opened or a data sheet has
+            issues that need fixing.
+    """
+    workbook = _open_workbook(xlsx_path)
+    try:
+        plans = plan_sheets(workbook, classify=classify)
+    finally:
+        workbook.close()
+
+    skip_sheets = {p.title for p in plans if p.role == "metadata"}
+    metadata_text = {
+        p.title: p.text for p in plans if p.role == "metadata" and p.text
+    }
+    warnings = [
+        f"Sheet '{p.title}' treated as documentation, not loaded as a table "
+        f"({p.reason})."
+        for p in plans
+        if p.role == "metadata"
+    ]
+
+    db_path = convert_xlsx_to_sqlite(xlsx_path, skip_sheets=skip_sheets)
+    return db_path, warnings, metadata_text
