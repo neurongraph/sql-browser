@@ -47,6 +47,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Office temp/lock files (e.g. Excel's ~$workbook.xlsx)
+~$*
+
 # Database files (for testing)
 *.db
 *.sqlite
