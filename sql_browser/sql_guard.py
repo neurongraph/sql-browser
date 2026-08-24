@@ -24,7 +24,7 @@ from .logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_ROW_LIMIT = 1000
+DEFAULT_ROW_LIMIT = 2000
 
 # Statement/expression types that make a query more than a read. If any of
 # these appear anywhere in the parsed tree, the query is rejected.

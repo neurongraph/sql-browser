@@ -554,12 +554,17 @@ function createTurn(question) {
     resultsSection: node.querySelector(".results-section"),
     resultsMeta: node.querySelector(".results-meta"),
     resultsTable: node.querySelector(".results-table"),
+    copyBtn: node.querySelector(".copy-btn"),
+    csvBtn: node.querySelector(".csv-btn"),
     mismatches: [],
+    _result: null,
   };
 
   node.querySelector(".q-text").textContent = question;
   turn.runBtn.addEventListener("click", () => runSql(turn, []));
   turn.applyBtn.addEventListener("click", () => applyPicks(turn));
+  turn.copyBtn.addEventListener("click", () => copyResult(turn));
+  turn.csvBtn.addEventListener("click", () => downloadCsv(turn, node.querySelector(".q-text").textContent));
 
   els.history.appendChild(node);
   node.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -714,6 +719,7 @@ function renderResult(turn, result) {
   setStatus(turn, "");
 
   const { columns, rows, row_count } = result;
+  turn._result = result;
   turn.resultsMeta.textContent = `${row_count} row${row_count === 1 ? "" : "s"}`;
 
   const thead = "<thead><tr>" +
@@ -734,6 +740,62 @@ function renderResult(turn, result) {
 
   turn.resultsTable.innerHTML = thead + tbody;
   show(turn.resultsSection);
+}
+
+// --------------------------------------------------------------------------- //
+// Export helpers
+// --------------------------------------------------------------------------- //
+
+function resultToTsv(result) {
+  const escape = (v) => (v === null ? "" : String(v).replace(/\t/g, " ").replace(/\n/g, " "));
+  const rows = [result.columns, ...result.rows];
+  return rows.map((row) => row.map(escape).join("\t")).join("\n");
+}
+
+function resultToCsv(result) {
+  const quote = (v) => {
+    const s = v === null ? "" : String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const rows = [result.columns, ...result.rows];
+  return rows.map((row) => row.map(quote).join(",")).join("\n");
+}
+
+async function copyResult(turn) {
+  if (!turn._result) return;
+  const tsv = resultToTsv(turn._result);
+  try {
+    await navigator.clipboard.writeText(tsv);
+    const orig = turn.copyBtn.textContent;
+    turn.copyBtn.textContent = "Copied!";
+    setTimeout(() => { turn.copyBtn.textContent = orig; }, 1500);
+  } catch {
+    // fallback: select a temporary textarea
+    const ta = document.createElement("textarea");
+    ta.value = tsv;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    const orig = turn.copyBtn.textContent;
+    turn.copyBtn.textContent = "Copied!";
+    setTimeout(() => { turn.copyBtn.textContent = orig; }, 1500);
+  }
+}
+
+function downloadCsv(turn, question) {
+  if (!turn._result) return;
+  const csv = resultToCsv(turn._result);
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const slug = question.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 48) || "results";
+  a.href = url;
+  a.download = `${slug}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // --------------------------------------------------------------------------- //
