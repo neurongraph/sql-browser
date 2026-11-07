@@ -56,6 +56,27 @@ def build_schema(db_inspector: DatabaseInspector) -> Dict[str, Dict[str, str]]:
     return schema
 
 
+def transpile_to_dialect(sql: str, dialect: str = "sqlite") -> str:
+    """Normalize a query to target dialect syntax (sqlite or duckdb).
+
+    Tries to parse as target dialect first, falling back to permissive dialects
+    (e.g. MySQL) or unconstrained. When dialect is sqlite, runs
+    repair_compound_order_limit. On total failure returns the original query.
+    """
+    read_dialects = (dialect, "sqlite", "mysql", None) if dialect != "sqlite" else ("sqlite", "mysql", None)
+    for read in read_dialects:
+        try:
+            out = sqlglot.transpile(sql, read=read, write=dialect)
+            if out:
+                result = out[0]
+                if dialect == "sqlite":
+                    return repair_compound_order_limit(result)
+                return result
+        except Exception:
+            continue
+    return sql
+
+
 def transpile_to_sqlite(sql: str) -> str:
     """Normalize a query to SQLite syntax.
 
@@ -67,14 +88,7 @@ def transpile_to_sqlite(sql: str) -> str:
     A `repair_compound_order_limit` pass runs on the result to fix a common
     LLM mistake that even a successful transpile leaves in place.
     """
-    for read in ("sqlite", "mysql", None):
-        try:
-            out = sqlglot.transpile(sql, read=read, write="sqlite")
-            if out:
-                return repair_compound_order_limit(out[0])
-        except Exception:
-            continue
-    return sql
+    return transpile_to_dialect(sql, dialect="sqlite")
 
 
 def repair_compound_order_limit(sql: str) -> str:
@@ -146,7 +160,7 @@ def repair_compound_order_limit(sql: str) -> str:
     return expression.sql(dialect="sqlite")
 
 
-def is_read_only(sql: str) -> bool:
+def is_read_only(sql: str, dialect: str = "sqlite") -> bool:
     """Return True only for a single read-only SELECT/UNION statement.
 
     Correct where a keyword blacklist is not: it won't false-reject a column
@@ -154,7 +168,7 @@ def is_read_only(sql: str) -> bool:
     like ``SELECT ...; DROP TABLE x``.
     """
     try:
-        statements = [s for s in sqlglot.parse(sql, read="sqlite") if s is not None]
+        statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
     except Exception:
         return False
 
@@ -168,7 +182,9 @@ def is_read_only(sql: str) -> bool:
     return not any(stmt.find(kind) for kind in _FORBIDDEN)
 
 
-def find_schema_problems(sql: str, schema: Dict[str, Dict[str, str]]) -> List[str]:
+def find_schema_problems(
+    sql: str, schema: Dict[str, Dict[str, str]], dialect: str = "sqlite"
+) -> List[str]:
     """Return human-readable problems if the query references unknown tables/columns.
 
     An empty list means "no detectable problem" - which includes the case
@@ -177,7 +193,7 @@ def find_schema_problems(sql: str, schema: Dict[str, Dict[str, str]]) -> List[st
     the LLM as a repair hint.
     """
     try:
-        expression = sqlglot.parse_one(sql, read="sqlite")
+        expression = sqlglot.parse_one(sql, read=dialect)
     except Exception:
         return []
     if expression is None:
@@ -185,7 +201,7 @@ def find_schema_problems(sql: str, schema: Dict[str, Dict[str, str]]) -> List[st
 
     try:
         # Qualify a copy so we only validate here; callers decide what to run.
-        qualify(expression.copy(), schema=schema, dialect="sqlite")
+        qualify(expression.copy(), schema=schema, dialect=dialect)
     except OptimizeError as e:
         return [str(e)]
     except Exception:
@@ -194,7 +210,7 @@ def find_schema_problems(sql: str, schema: Dict[str, Dict[str, str]]) -> List[st
     return []
 
 
-def enforce_limit(sql: str, limit: int = DEFAULT_ROW_LIMIT) -> str:
+def enforce_limit(sql: str, limit: int = DEFAULT_ROW_LIMIT, dialect: str = "sqlite") -> str:
     """Append a LIMIT to a top-level SELECT that lacks one.
 
     Protects the caller (especially the web UI) from a "show me everything"
@@ -203,11 +219,11 @@ def enforce_limit(sql: str, limit: int = DEFAULT_ROW_LIMIT) -> str:
     left untouched to stay safe.
     """
     try:
-        expression = sqlglot.parse_one(sql, read="sqlite")
+        expression = sqlglot.parse_one(sql, read=dialect)
     except Exception:
         return sql
     if isinstance(expression, exp.Select) and not expression.args.get("limit"):
-        return expression.limit(limit).sql(dialect="sqlite")
+        return expression.limit(limit).sql(dialect=dialect)
     return sql
 
 # Made with Bob

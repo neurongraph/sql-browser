@@ -99,9 +99,9 @@ def _get_candidates(
 # AST helpers
 # --------------------------------------------------------------------------- #
 
-def _safe_parse(sql: str) -> Optional[exp.Expression]:
+def _safe_parse(sql: str, dialect: str = "sqlite") -> Optional[exp.Expression]:
     try:
-        return sqlglot.parse_one(sql, read="sqlite")
+        return sqlglot.parse_one(sql, read=dialect)
     except Exception:
         return None
 
@@ -190,7 +190,8 @@ def find_value_mismatches(
     Returns:
         (possibly-corrected SQL, list of unresolved mismatches)
     """
-    expression = _safe_parse(sql)
+    dialect = getattr(db_inspector, "dialect", "sqlite")
+    expression = _safe_parse(sql, dialect=dialect)
     if expression is None:
         return _legacy_find_value_mismatches(sql, db_inspector)
 
@@ -238,11 +239,11 @@ def find_value_mismatches(
                 {"column": column, "attempted_value": value, "candidates": candidates}
             )
 
-    result_sql = expression.sql(dialect="sqlite") if changed else sql
+    result_sql = expression.sql(dialect=dialect) if changed else sql
     return result_sql, mismatches
 
 
-def apply_value_choices(sql: str, choices: List[Dict[str, str]]) -> str:
+def apply_value_choices(sql: str, choices: List[Dict[str, str]], dialect: str = "sqlite") -> str:
     """Apply user-picked replacements to a query. Stateless (no db access).
 
     Args:
@@ -250,6 +251,7 @@ def apply_value_choices(sql: str, choices: List[Dict[str, str]]) -> str:
         choices: items shaped like
             {"column": ..., "attempted_value": ..., "chosen": ...}
             A falsy/absent "chosen" leaves that filter unchanged.
+        dialect: Target SQL dialect
 
     Returns:
         The rewritten SQL.
@@ -258,7 +260,7 @@ def apply_value_choices(sql: str, choices: List[Dict[str, str]]) -> str:
     if not active:
         return sql
 
-    expression = _safe_parse(sql)
+    expression = _safe_parse(sql, dialect=dialect)
     if expression is None:
         # Best-effort string replacement if the query won't parse.
         for choice in active:
@@ -270,7 +272,7 @@ def apply_value_choices(sql: str, choices: List[Dict[str, str]]) -> str:
         for column_node, literal in sites:
             if column_node.name == choice["column"] and literal.name == choice["attempted_value"]:
                 literal.replace(exp.Literal.string(choice["chosen"]))
-    return expression.sql(dialect="sqlite")
+    return expression.sql(dialect=dialect)
 
 
 def resolve_value_mismatches(
@@ -305,7 +307,8 @@ def resolve_value_mismatches(
                 }
             )
 
-    return apply_value_choices(fixed_sql, choices)
+    dialect = getattr(db_inspector, "dialect", "sqlite")
+    return apply_value_choices(fixed_sql, choices, dialect=dialect)
 
 
 # --------------------------------------------------------------------------- #

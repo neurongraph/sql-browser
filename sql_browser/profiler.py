@@ -8,12 +8,12 @@ For each column we record either:
     what values are actually in bounds.
 
 Results are cached in a sidecar table (`_sql_browser_profile`) inside the
-same SQLite database, keyed by each table's current row count so a changed
-table gets re-profiled while an unchanged one is loaded from cache.
+database when writable, or in the inspector instance when read-only (e.g. DuckDB).
+For tables with a cache table, cache is keyed by each table's current row count
+so a changed table gets re-profiled while an unchanged one is loaded from cache.
 """
 
 import json
-import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -30,49 +30,56 @@ def _is_numeric_type(col_type: str) -> bool:
     return any(key in t for key in ("INT", "REAL", "FLOA", "DOUB", "NUM", "DEC"))
 
 
-def _ensure_profile_table(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {PROFILE_TABLE} (
-            table_name TEXT NOT NULL,
-            column_name TEXT NOT NULL,
-            profile_type TEXT NOT NULL,
-            profile_json TEXT NOT NULL,
-            computed_at TEXT NOT NULL,
-            PRIMARY KEY (table_name, column_name)
+def _ensure_profile_table(connection: Any) -> bool:
+    try:
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {PROFILE_TABLE} (
+                table_name TEXT NOT NULL,
+                column_name TEXT NOT NULL,
+                profile_type TEXT NOT NULL,
+                profile_json TEXT NOT NULL,
+                computed_at TEXT NOT NULL,
+                PRIMARY KEY (table_name, column_name)
+            )
+            """
         )
-        """
-    )
+        return True
+    except Exception:
+        return False
 
 
 def _load_cached_table_profile(
-    connection: sqlite3.Connection, table: str, current_row_count: int
+    connection: Any, table: str, current_row_count: int
 ) -> Optional[Dict[str, Dict[str, Any]]]:
     """Return the cached profile for a table if it's still fresh, else None."""
-    cursor = connection.cursor()
-    cursor.execute(
-        f"SELECT column_name, profile_type, profile_json FROM {PROFILE_TABLE} WHERE table_name = ?",
-        (table,),
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        return None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            f"SELECT column_name, profile_type, profile_json FROM {PROFILE_TABLE} WHERE table_name = ?",
+            (table,),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None
 
-    table_profile: Dict[str, Dict[str, Any]] = {}
-    cached_row_count = None
-    for column_name, profile_type, profile_json in rows:
-        if column_name == _META_COLUMN:
-            cached_row_count = json.loads(profile_json)["row_count"]
-            continue
-        table_profile[column_name] = {"type": profile_type, **json.loads(profile_json)}
+        table_profile: Dict[str, Dict[str, Any]] = {}
+        cached_row_count = None
+        for column_name, profile_type, profile_json in rows:
+            if column_name == _META_COLUMN:
+                cached_row_count = json.loads(profile_json)["row_count"]
+                continue
+            table_profile[column_name] = {"type": profile_type, **json.loads(profile_json)}
 
-    if cached_row_count != current_row_count:
+        if cached_row_count != current_row_count:
+            return None
+        return table_profile
+    except Exception:
         return None
-    return table_profile
 
 
 def _profile_column(
-    connection: sqlite3.Connection, table: str, column: str, col_type: str
+    connection: Any, table: str, column: str, col_type: str
 ) -> Optional[Dict[str, Any]]:
     cursor = connection.cursor()
 
@@ -98,7 +105,7 @@ def _profile_column(
 
 
 def _save_table_profile(
-    connection: sqlite3.Connection,
+    connection: Any,
     table: str,
     row_count: int,
     table_profile: Dict[str, Dict[str, Any]],
@@ -137,13 +144,16 @@ def profile_database(
     if not connection:
         raise RuntimeError("Database not connected")
 
-    _ensure_profile_table(connection)
+    if not force and db_inspector.profile:
+        return db_inspector.profile
+
+    can_cache_in_db = _ensure_profile_table(connection)
 
     full_profile: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for table in db_inspector.get_tables():
         row_count = db_inspector._get_row_count(table)
 
-        if not force:
+        if not force and can_cache_in_db:
             cached = _load_cached_table_profile(connection, table, row_count)
             if cached is not None:
                 full_profile[table] = cached
@@ -155,10 +165,22 @@ def profile_database(
             if result is not None:
                 table_profile[col["name"]] = result
 
-        _save_table_profile(connection, table, row_count, table_profile)
+        if can_cache_in_db:
+            try:
+                _save_table_profile(connection, table, row_count, table_profile)
+            except Exception:
+                can_cache_in_db = False
+
         full_profile[table] = table_profile
 
-    connection.commit()
+    if can_cache_in_db:
+        try:
+            connection.commit()
+        except Exception:
+            pass
+
+    db_inspector.profile = full_profile
     return full_profile
+
 
 # Made with Bob

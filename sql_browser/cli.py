@@ -9,7 +9,12 @@ from rich.prompt import Prompt
 
 from .config import DEFAULT_MODEL, settings
 from .context import select_examples
-from .database import DatabaseInspector
+from .database import (
+    DatabaseInspector,
+    DuckDBInspector,
+    SQLiteInspector,
+    create_inspector,
+)
 from .excel_loader import EXCEL_EXTENSIONS, ExcelLoadError, convert_xlsx_to_sqlite
 from .llm import LLMQueryTranslator
 from .metadata import (
@@ -25,13 +30,14 @@ from .metadata import (
     write_document,
 )
 from .profiler import profile_database
-from .query_corrector import resolve_value_mismatches
+from .query_corrector import find_value_mismatches, resolve_value_mismatches
 from .query_executor import QueryExecutor
 from .sql_guard import (
     build_schema,
     enforce_limit,
     find_schema_problems,
     is_read_only,
+    transpile_to_dialect,
     transpile_to_sqlite,
 )
 from .logger import get_logger, LOGS_DIR
@@ -272,7 +278,8 @@ class SQLBrowserSession:
                     )
 
                     # Cap unbounded result sets
-                    sql = enforce_limit(sql)
+                    dialect = getattr(self.db_inspector, "dialect", "sqlite")
+                    sql = enforce_limit(sql, dialect=dialect)
 
                     # Execute and display
                     logger.debug(f"Executing SQL: {sql}")
@@ -321,23 +328,26 @@ class SQLBrowserSession:
     ) -> Optional[tuple]:
         """Normalize, validate, and (if needed) repair a generated query.
 
-        Transpiles the query to SQLite, rejects anything that isn't read-only,
+        Transpiles the query to target dialect, rejects anything that isn't read-only,
         and - when it references tables/columns that don't exist - asks the LLM
         for a single repair using the specific error as a hint.
 
         Returns:
             (sql, explanation) ready to run, or None if the query was rejected.
         """
-        sql = transpile_to_sqlite(sql)
+        dialect = getattr(self.db_inspector, "dialect", "sqlite")
+        sql = transpile_to_dialect(sql, dialect=dialect)
 
-        if not is_read_only(sql):
+        if not is_read_only(sql, dialect=dialect):
             self.executor.display_warning(
                 "Generated query contains potentially unsafe operations. "
                 "Only SELECT queries are allowed."
             )
             return None
 
-        problems = find_schema_problems(sql, build_schema(self.db_inspector))
+        problems = find_schema_problems(
+            sql, build_schema(self.db_inspector), dialect=dialect
+        )
         if problems:
             logger.info(f"Schema validation problems: {problems}")
             self.executor.display_info("Refining query to match the schema...")
@@ -352,8 +362,8 @@ class SQLBrowserSession:
                         "; ".join(problems),
                         self.conversation_history,
                     )
-                candidate = transpile_to_sqlite(repaired["sql"])
-                if is_read_only(candidate):
+                candidate = transpile_to_dialect(repaired["sql"], dialect=dialect)
+                if is_read_only(candidate, dialect=dialect):
                     sql = candidate
                     explanation = repaired.get("explanation", explanation)
                     logger.info(f"Repaired SQL: {sql}")
@@ -583,7 +593,9 @@ class SQLBrowserSession:
         self.executor.console.print(help_text)
 
 
-def _init_metadata(source: Path, model: str, use_llm: bool) -> None:
+def _init_metadata(
+    source: Path, model: str, use_llm: bool, out: Optional[Path] = None
+) -> None:
     """Write a starter metadata file for a database, then return.
 
     Kept separate from SQLBrowserSession because scaffolding needs no LLM at
@@ -594,12 +606,17 @@ def _init_metadata(source: Path, model: str, use_llm: bool) -> None:
         source: The database or workbook to document
         model: Ollama model to use for drafting
         use_llm: Whether to have the model draft descriptions
+        out: Optional destination metadata file path
 
     Raises:
         typer.Exit: The target file already exists, or the workbook is unreadable
     """
-    destination = source.with_suffix("")
-    destination = destination.with_name(f"{destination.name}.meta.yaml")
+    if out is not None:
+        destination = out
+    else:
+        destination = source.with_suffix("")
+        destination = destination.with_name(f"{destination.name}.meta.yaml")
+
     if destination.exists():
         # Never clobber documentation someone has written by hand.
         typer.echo(
@@ -609,14 +626,7 @@ def _init_metadata(source: Path, model: str, use_llm: bool) -> None:
         )
         raise typer.Exit(1)
 
-    temp_db_path: Optional[Path] = None
-    if source.suffix.lower() in EXCEL_EXTENSIONS:
-        temp_db_path = convert_xlsx_to_sqlite(source)
-        db_path = temp_db_path
-    else:
-        db_path = source
-
-    inspector = DatabaseInspector(str(db_path))
+    inspector = create_inspector(source)
     try:
         inspector.connect()
 
@@ -644,8 +654,6 @@ def _init_metadata(source: Path, model: str, use_llm: bool) -> None:
         )
     finally:
         inspector.disconnect()
-        if temp_db_path:
-            temp_db_path.unlink(missing_ok=True)
 
     typer.echo(f"\nWrote {destination}")
     if use_llm:
@@ -665,7 +673,9 @@ def _count_items(metadata: Metadata) -> int:
     return total
 
 
-def _regenerate_metadata(source: Path, model: str) -> None:
+def _regenerate_metadata(
+    source: Path, model: str, metadata_path: Optional[Path] = None
+) -> None:
     """Regenerate a sidecar's structured blocks from its canonical prose.
 
     The command-line twin of the web editor's Save: it parses the prose the
@@ -678,12 +688,13 @@ def _regenerate_metadata(source: Path, model: str) -> None:
     Args:
         source: The database or workbook whose sidecar to regenerate
         model: Ollama model used to parse the prose
+        metadata_path: Optional explicit metadata path
 
     Raises:
         typer.Exit: No sidecar exists, or its prose is empty (nothing to do)
     """
-    sidecar = discover(source)
-    if sidecar is None:
+    sidecar = metadata_path or discover(source)
+    if sidecar is None or not sidecar.exists():
         typer.echo(
             f"Error: no metadata file found for '{source.name}'. Create one first "
             f"with:\n  sql-browser --init-metadata {source.name}",
@@ -707,14 +718,7 @@ def _regenerate_metadata(source: Path, model: str) -> None:
         # blocks just mean nothing to preserve for prose-less sections.
         existing = Metadata()
 
-    temp_db_path: Optional[Path] = None
-    if source.suffix.lower() in EXCEL_EXTENSIONS:
-        temp_db_path = convert_xlsx_to_sqlite(source)
-        db_path = temp_db_path
-    else:
-        db_path = source
-
-    inspector = DatabaseInspector(str(db_path))
+    inspector = create_inspector(source)
     try:
         inspector.connect()
 
@@ -735,8 +739,6 @@ def _regenerate_metadata(source: Path, model: str) -> None:
         )
     finally:
         inspector.disconnect()
-        if temp_db_path:
-            temp_db_path.unlink(missing_ok=True)
 
     warnings = gen_warnings + recon_warnings
     typer.echo(
@@ -749,11 +751,38 @@ def _regenerate_metadata(source: Path, model: str) -> None:
             typer.echo(f"  - {warning}", err=True)
 
 
+class DefaultCommandGroup(typer.core.TyperGroup):
+    """Click group that dispatches to default 'browse' command when no subcommand given."""
+
+    def parse_args(self, ctx, args):
+        if not args:
+            return super().parse_args(ctx, ["browse"])
+        first_token = None
+        for a in args:
+            if not a.startswith("-"):
+                first_token = a
+                break
+
+        if first_token in self.commands or (first_token is None and any(a in ("--help", "-h") for a in args)):
+            return super().parse_args(ctx, args)
+
+        return super().parse_args(ctx, ["browse"] + list(args))
+
+
 app = typer.Typer(
+    cls=DefaultCommandGroup,
     name="sql-browser",
-    help="SQL Browser - Natural language SQLite database explorer",
-    add_completion=False
+    help="SQL Browser - Natural language SQLite and DuckDB database explorer",
+    add_completion=False,
+    no_args_is_help=False,
 )
+
+metadata_app = typer.Typer(
+    name="metadata",
+    help="Metadata sidecar management (init, validate, regenerate)",
+    add_completion=False,
+)
+app.add_typer(metadata_app, name="metadata")
 
 
 def version_callback(value: bool):
@@ -764,11 +793,11 @@ def version_callback(value: bool):
         raise typer.Exit()
 
 
-@app.command(name="sql-browser")
+@app.command(name="browse", hidden=True)
 def cli(
     database: Optional[Path] = typer.Argument(
         None,
-        help="Path to a SQLite database file, or an Excel workbook (.xlsx/.xlsm) "
+        help="Path to a SQLite or DuckDB database file, or an Excel workbook (.xlsx/.xlsm) "
         "whose sheets will be loaded as tables. Optional with --web: the file "
         "can be picked in the browser instead",
         exists=True,
@@ -857,6 +886,7 @@ def cli(
 
       \b
       sql-browser mydata.db
+      sql-browser mydata.duckdb
       sql-browser mydata.xlsx
       sql-browser --model gemma4:31b-cloud mydata.db
       sql-browser --no-profile mydata.db
@@ -970,6 +1000,382 @@ def cli(
             typer.echo(f"  - {issue}", err=True)
         raise typer.Exit(1)
     session.start()
+
+
+@app.command(name="query")
+def query_command(
+    question: str = typer.Argument(
+        ...,
+        help="Natural language question to translate and execute",
+    ),
+    database: Path = typer.Argument(
+        ...,
+        help="Path to database file (.db, .sqlite, .duckdb, .parquet, .xlsx)",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    metadata: Optional[Path] = typer.Option(
+        None,
+        "--metadata",
+        help="Path to a metadata file, bypassing discovery",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    no_metadata: bool = typer.Option(
+        False,
+        "--no-metadata",
+        help="Ignore any sidecar metadata file",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output structured JSON to stdout",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Translate and repair query without executing",
+    ),
+) -> None:
+    """Execute a natural language query against a database without interactive session."""
+    if metadata and no_metadata:
+        typer.echo(
+            "Error: --metadata and --no-metadata contradict each other. Pass one or the other.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    inspector = create_inspector(database)
+    dialect = getattr(inspector, "dialect", "sqlite")
+
+    try:
+        inspector.connect()
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        if json_output:
+            import json
+            print(json.dumps({
+                "question": question,
+                "sql": "",
+                "rows": [],
+                "corrections": [],
+                "notes": "",
+                "warnings": [f"Could not connect: {e}"],
+                "error": str(e)
+            }, indent=2))
+        else:
+            typer.echo(f"Error: could not connect to {database}: {e}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        # Resolve metadata and profile
+        meta, warnings = resolve_metadata(
+            inspector,
+            source_path=database,
+            override=metadata,
+            use_file=not no_metadata,
+        )
+        inspector.metadata = meta
+        inspector.metadata_warnings = warnings
+        inspector.profile = profile_database(inspector)
+
+        # Context & prompt
+        schema_info = inspector.get_schema_description(question=question)
+        examples = select_examples(
+            question, meta.examples if meta else []
+        )
+
+        llm = LLMQueryTranslator(model=model or DEFAULT_MODEL)
+        all_warnings = list(warnings)
+        corrections: List[str] = []
+
+        try:
+            res = llm.translate_to_sql(question, schema_info, [], examples=examples)
+            sql = res.get("sql", "")
+            notes = res.get("explanation", "")
+            confidence = res.get("confidence", "medium")
+            if confidence == "low":
+                all_warnings.append("Low confidence in generated query")
+        except Exception as e:
+            logger.error(f"LLM translation error: {e}")
+            if json_output:
+                import json
+                print(json.dumps({
+                    "question": question,
+                    "sql": "",
+                    "rows": [],
+                    "corrections": corrections,
+                    "notes": "",
+                    "warnings": all_warnings + [f"Translation error: {e}"],
+                    "error": str(e)
+                }, indent=2))
+            else:
+                typer.echo(f"Error: translation failed: {e}", err=True)
+            raise typer.Exit(1)
+
+        # SQL Guard & Repair
+        sql = transpile_to_dialect(sql, dialect=dialect)
+        if not is_read_only(sql, dialect=dialect):
+            msg = "Generated query is not read-only. Only SELECT queries are allowed."
+            logger.warning(msg)
+            if json_output:
+                import json
+                print(json.dumps({
+                    "question": question,
+                    "sql": sql,
+                    "rows": [],
+                    "corrections": corrections,
+                    "notes": notes,
+                    "warnings": all_warnings,
+                    "error": msg
+                }, indent=2))
+            else:
+                typer.echo(f"Error: {msg}", err=True)
+            raise typer.Exit(1)
+
+        problems = find_schema_problems(
+            sql, build_schema(inspector), dialect=dialect
+        )
+        if problems:
+            corrections.append(f"Schema problems: {'; '.join(problems)}")
+            try:
+                repaired = llm.repair_sql(
+                    question, schema_info, sql, "; ".join(problems), []
+                )
+                cand = transpile_to_dialect(repaired.get("sql", ""), dialect=dialect)
+                if is_read_only(cand, dialect=dialect):
+                    sql = cand
+                    if repaired.get("explanation"):
+                        notes = repaired["explanation"]
+                    corrections.append("Query repaired to match schema")
+            except Exception as e:
+                all_warnings.append(f"Schema repair attempt failed: {e}")
+
+        # Literal value correction
+        fixed_sql, mismatches = find_value_mismatches(sql, inspector)
+        if fixed_sql != sql:
+            corrections.append("Auto-corrected literal values")
+            sql = fixed_sql
+        for m in mismatches:
+            all_warnings.append(
+                f"Literal value '{m.get('attempted_value')}' not found in column '{m.get('column')}'"
+            )
+
+        # Enforce limit
+        sql = enforce_limit(sql, limit=1000, dialect=dialect)
+
+        rows: List[Dict[str, Any]] = []
+        if not dry_run:
+            try:
+                cols, raw_rows = inspector.execute_query(sql)
+                rows = [dict(zip(cols, row)) for row in raw_rows]
+            except Exception as e:
+                corrections.append(f"Runtime error: {e}")
+                repaired_ok = False
+                try:
+                    repaired = llm.repair_sql(question, schema_info, sql, str(e), [])
+                    cand = transpile_to_dialect(repaired.get("sql", ""), dialect=dialect)
+                    if is_read_only(cand, dialect=dialect):
+                        cand = enforce_limit(cand, limit=1000, dialect=dialect)
+                        cols, raw_rows = inspector.execute_query(cand)
+                        sql = cand
+                        rows = [dict(zip(cols, row)) for row in raw_rows]
+                        corrections.append("Query repaired after runtime error")
+                        repaired_ok = True
+                except Exception:
+                    pass
+
+                if not repaired_ok:
+                    if json_output:
+                        import json
+                        print(json.dumps({
+                            "question": question,
+                            "sql": sql,
+                            "rows": [],
+                            "corrections": corrections,
+                            "notes": notes,
+                            "warnings": all_warnings,
+                            "error": str(e)
+                        }, indent=2, default=str))
+                    else:
+                        typer.echo(f"Execution error: {e}", err=True)
+                    raise typer.Exit(1)
+
+        if json_output:
+            import json
+            payload = {
+                "question": question,
+                "sql": sql,
+                "rows": rows,
+                "corrections": corrections,
+                "notes": notes,
+                "warnings": all_warnings,
+            }
+            print(json.dumps(payload, indent=2, default=str))
+        else:
+            from rich.console import Console
+            from rich.table import Table
+            console = Console()
+            console.print(f"[bold cyan]Question:[/bold cyan] {question}")
+            console.print(f"[bold cyan]SQL:[/bold cyan] {sql}")
+            if notes:
+                console.print(f"[dim]{notes}[/dim]")
+            if dry_run:
+                console.print("[yellow]Dry run: query not executed.[/yellow]")
+            else:
+                if rows:
+                    table_ui = Table(title="Results")
+                    for col_name in rows[0].keys():
+                        table_ui.add_column(str(col_name))
+                    for r in rows:
+                        table_ui.add_row(*[str(v) if v is not None else "" for v in r.values()])
+                    console.print(table_ui)
+                else:
+                    console.print("[dim]No rows returned.[/dim]")
+    finally:
+        inspector.disconnect()
+
+
+@metadata_app.command(name="init")
+def metadata_init_command(
+    database: Path = typer.Argument(
+        ...,
+        help="Path to database file (.db, .sqlite, .duckdb, .parquet, .xlsx)",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        "--out",
+        "-o",
+        help="Output metadata file path (default: <database>.meta.yaml)",
+    ),
+    llm_draft: bool = typer.Option(
+        False,
+        "--llm-draft",
+        help="Have LLM draft descriptions",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
+    ),
+) -> None:
+    """Initialize metadata scaffold for a database file."""
+    try:
+        _init_metadata(database, model or DEFAULT_MODEL, llm_draft, out=out)
+    except ExcelLoadError as e:
+        logger.error(f"Failed to load Excel workbook: {e}")
+        typer.echo(f"Error: could not load '{database.name}':", err=True)
+        for issue in e.issues:
+            typer.echo(f"  - {issue}", err=True)
+        raise typer.Exit(1)
+
+
+@metadata_app.command(name="validate")
+def metadata_validate_command(
+    database: Path = typer.Argument(
+        ...,
+        help="Path to database file (.db, .sqlite, .duckdb, .parquet, .xlsx)",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    metadata: Optional[Path] = typer.Option(
+        None,
+        "--metadata",
+        "-m",
+        help="Path to metadata file (default: discover sidecar next to database)",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+) -> None:
+    """Reconcile metadata against live schema and report warnings."""
+    target_meta = metadata or discover(database)
+    if target_meta is None or not target_meta.exists():
+        typer.echo(
+            f"Error: no metadata file found for '{database.name}'.", err=True
+        )
+        raise typer.Exit(1)
+
+    try:
+        inspector = create_inspector(database)
+    except ExcelLoadError as e:
+        logger.error(f"Failed to load Excel workbook: {e}")
+        typer.echo(f"Error: could not load '{database.name}':", err=True)
+        for issue in e.issues:
+            typer.echo(f"  - {issue}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        inspector.connect()
+        inspector.profile = profile_database(inspector)
+        loaded = load(target_meta)
+        reconciled_meta, warnings = reconcile(loaded, inspector)
+    finally:
+        inspector.disconnect()
+
+    typer.echo(f"Validating {target_meta.name} against {database.name}...")
+    typer.echo(f"Loaded {len(reconciled_meta.tables)} table(s), {len(reconciled_meta.relationships)} relationship(s).")
+    if warnings:
+        typer.echo(f"\n{len(warnings)} warning(s):", err=True)
+        for w in warnings:
+            typer.echo(f"  - {w}", err=True)
+    else:
+        typer.echo("Metadata is valid. 0 warnings.")
+
+
+@metadata_app.command(name="regenerate")
+def metadata_regenerate_command(
+    database: Path = typer.Argument(
+        ...,
+        help="Path to database file (.db, .sqlite, .duckdb, .parquet, .xlsx)",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    metadata: Optional[Path] = typer.Option(
+        None,
+        "--metadata",
+        "-m",
+        help="Path to metadata file (default: discover sidecar next to database)",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
+    ),
+) -> None:
+    """Regenerate structured metadata blocks from free-form prose."""
+    try:
+        _regenerate_metadata(database, model or DEFAULT_MODEL, metadata_path=metadata)
+    except ExcelLoadError as e:
+        logger.error(f"Failed to load Excel workbook: {e}")
+        typer.echo(f"Error: could not load '{database.name}':", err=True)
+        for issue in e.issues:
+            typer.echo(f"  - {issue}", err=True)
+        raise typer.Exit(1)
 
 
 def main():
