@@ -218,7 +218,24 @@ section { margin-top: 20px; }
 .status { color: var(--muted); font-size: 14px; }
 .status.error { color: var(--danger); }
 
-.results-meta { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+.results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.results-meta { color: var(--muted); font-size: 13px; }
+.export-actions { display: flex; gap: 6px; }
+.export-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+}
+.export-actions button:hover { color: var(--text); border-color: var(--accent-dim); background: var(--panel-2); }
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; max-height: 460px; }
 .results-table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .results-table th, .results-table td {

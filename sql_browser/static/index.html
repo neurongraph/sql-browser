@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SQL Browser</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=7" />
 </head>
 <body>
   <header>
@@ -99,7 +99,13 @@
         <section class="status hidden"></section>
 
         <section class="results-section hidden">
-          <div class="results-meta"></div>
+          <div class="results-header">
+            <div class="results-meta"></div>
+            <div class="export-actions">
+              <button type="button" class="copy-btn secondary">Copy</button>
+              <button type="button" class="csv-btn secondary">Download CSV</button>
+            </div>
+          </div>
           <div class="table-wrap">
             <table class="results-table"></table>
           </div>
@@ -143,6 +149,6 @@
     </label>
   </template>
 
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>
