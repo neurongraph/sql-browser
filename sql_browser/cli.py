@@ -809,7 +809,7 @@ def cli(
         None,
         "--model",
         "-m",
-        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
+        help=f"Model to use, on the configured provider (default: {DEFAULT_MODEL})",
     ),
     no_profile: bool = typer.Option(
         False,
@@ -1034,7 +1034,7 @@ def query_command(
         None,
         "--model",
         "-m",
-        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
+        help=f"Model to use, on the configured provider (default: {DEFAULT_MODEL})",
     ),
     json_output: bool = typer.Option(
         False,
@@ -1271,7 +1271,7 @@ def metadata_init_command(
         None,
         "--model",
         "-m",
-        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
+        help=f"Model to use, on the configured provider (default: {DEFAULT_MODEL})",
     ),
 ) -> None:
     """Initialize metadata scaffold for a database file."""
@@ -1364,7 +1364,7 @@ def metadata_regenerate_command(
     model: Optional[str] = typer.Option(
         None,
         "--model",
-        help=f"Ollama model to use (default: {DEFAULT_MODEL})",
+        help=f"Model to use, on the configured provider (default: {DEFAULT_MODEL})",
     ),
 ) -> None:
     """Regenerate structured metadata blocks from free-form prose."""

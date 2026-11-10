@@ -6,10 +6,43 @@ from typing import Dict, List, Optional
 
 import ollama
 from json_repair import repair_json
-from .config import DEFAULT_MODEL
+from .config import DEFAULT_MODEL, settings
 from .logger import get_logger
 
 logger = get_logger(__name__)
+
+_openai_client = None
+
+
+def _openai():
+    """The OpenAI-compatible client (lazy, one per process)."""
+    global _openai_client
+    if _openai_client is None:
+        import openai
+
+        if not settings.llm_base_url or not settings.llm_api_key:
+            raise RuntimeError(
+                "SQL_BROWSER_LLM_PROVIDER=openai needs SQL_BROWSER_LLM_BASE_URL and SQL_BROWSER_LLM_API_KEY"
+            )
+        _openai_client = openai.OpenAI(
+            api_key=settings.llm_api_key, base_url=settings.llm_base_url, timeout=settings.llm_timeout_s
+        )
+    return _openai_client
+
+
+def _chat(model: str, messages: list, json_mode: bool = True) -> dict:
+    """One chat request on the configured provider, returned in Ollama's shape
+    (`{"message": {"content": ...}}`) so every caller reads it the same way.
+
+    The OpenAI-compatible path sends no `temperature` or `response_format`
+    (some endpoints, e.g. Claude behind a gateway, reject them); the prompts
+    already ask for JSON and every caller repairs it."""
+    if settings.llm_provider == "openai":
+        response = _openai().chat.completions.create(model=model, messages=messages)
+        content = (response.choices[0].message.content or "") if response.choices else ""
+        return {"message": {"content": content}}
+    kwargs = {"format": "json"} if json_mode else {}
+    return ollama.chat(model=model, messages=messages, **kwargs)
 
 
 def list_models() -> list[str]:
@@ -55,7 +88,9 @@ class LLMQueryTranslator:
         self._verify_ollama()
 
     def _verify_ollama(self) -> None:
-        """Verify that Ollama is running and the model is available."""
+        """Verify that Ollama is running and the model is available (Ollama provider only)."""
+        if settings.llm_provider == "openai":
+            return
         try:
             # Check if Ollama is running
             ollama.list()
@@ -176,11 +211,7 @@ class LLMQueryTranslator:
             logger.debug(f"Messages: {json.dumps(messages, indent=2)}")
 
             start = time.monotonic()
-            response = ollama.chat(
-                model=self.model,
-                messages=messages,
-                format="json"
-            )
+            response = _chat(self.model, messages)
             logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
 
             # Log the raw response (convert to dict first)
@@ -370,11 +401,7 @@ Example: {{"suggestions": ["Show me all users", "What is the total revenue?", ..
                 f"(prompt ~{len(prompt)} chars, ~{len(prompt) // 4} tokens)"
             )
             start = time.monotonic()
-            response = ollama.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                format="json"
-            )
+            response = _chat(self.model, [{"role": "user", "content": prompt}])
             logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
 
             result = json.loads(response['message']['content'])
@@ -452,11 +479,7 @@ are not listed above."""
         try:
             logger.info(f"Requesting metadata draft for table '{table}'")
             start = time.monotonic()
-            response = ollama.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                format="json",
-            )
+            response = _chat(self.model, [{"role": "user", "content": prompt}])
             logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
 
             content = response["message"]["content"].strip()
@@ -510,11 +533,7 @@ are not listed above."""
         try:
             logger.info(f"Parsing prose for {label} ({len(prompt)} chars)")
             start = time.monotonic()
-            response = ollama.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                format="json",
-            )
+            response = _chat(self.model, [{"role": "user", "content": prompt}])
             logger.info(f"Ollama responded in {time.monotonic() - start:.1f}s")
 
             content = response["message"]["content"].strip()
@@ -549,11 +568,7 @@ are not listed above."""
 
         prompt = context.build_metadata_sheet_classifier_prompt(title, sample)
         try:
-            response = ollama.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                format="json",
-            )
+            response = _chat(self.model, [{"role": "user", "content": prompt}])
             content = response["message"]["content"].strip()
             try:
                 result = json.loads(content)

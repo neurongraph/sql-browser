@@ -37,6 +37,19 @@ class Settings(BaseSettings):
         default="gemma4:31b-cloud",
         description="Ollama model used when none is given on the CLI or in the UI",
     )
+    llm_provider: str = Field(
+        default="ollama",
+        description="LLM backend: `ollama` (local) or `openai` (any OpenAI-compatible chat-completions endpoint)",
+    )
+    llm_base_url: str = Field(
+        default="",
+        description="Base URL of the OpenAI-compatible endpoint (e.g. https://host/v1); used when llm_provider=openai",
+    )
+    llm_api_key: str = Field(
+        default="",
+        description="API key for the OpenAI-compatible endpoint; set via SQL_BROWSER_LLM_API_KEY, never on the command line",
+    )
+    llm_timeout_s: int = Field(default=120, gt=0, description="Per-request timeout for the OpenAI-compatible endpoint")
     max_upload_mb: int = Field(
         default=256,
         gt=0,
